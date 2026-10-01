@@ -30,6 +30,13 @@ Options (`src/main.lisp`): `--host`, `--port`, `--dir`, `--io-threads`,
 `--name`, `--description`, `--pubkey`, `--contact`, `--log-level`.
 `GET /stats` returns counters, latency percentiles and GC pauses as JSON.
 
+Two hooks, available from Lisp (`make-config`), not the command line:
+`:event-policy` (a function of each parsed EVENT: accept, refuse with a
+reason, or accept now and ingest N seconds later; for test networks and
+operator policy) and `:retain-ephemeral` / `:ephemeral-ttl` (keep matching
+ephemeral events in memory for a while and return them to REQ filters that
+set `since`, for clients that poll for replies instead of subscribing first).
+
 ## Design
 
 ```

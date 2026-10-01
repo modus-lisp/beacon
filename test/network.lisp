@@ -162,3 +162,39 @@
     (let ((store (open-store dir)))
       (check "events survive a restart" (>= (store-event-count store) 300))
       (close-store store))))
+
+(defun run-policy-tests ()
+  "EVENT-POLICY (drop, delay) and RETAIN-EPHEMERAL, on a relay of their own."
+  (let* ((dir (fresh-dir "policy"))
+         (relay (start-relay (make-config :port 0 :dir (namestring dir) :io-threads 1 :verify-threads 1
+                                          :query-threads 1 :sync nil
+                                          :event-policy (lambda (e) (case (event-kind e) (7 '(:drop "test")) (8 1)))
+                                          :retain-ephemeral (lambda (e) (= (event-kind e) 20002))
+                                          :ephemeral-ttl 60))))
+    (unwind-protect
+         (let* ((*relay* relay) (alice (nkey)) (me (cl-nostr.keys:public-hex alice))
+                (r (cl-nostr.relay:connect-relay (relay-url))))
+           (flet ((by-kind (k &key since)
+                    (fetch r (if since
+                                 (cl-nostr.filter:make-filter :kinds (list k) :authors (list me) :since since)
+                                 (cl-nostr.filter:make-filter :kinds (list k) :authors (list me))))))
+             (unwind-protect
+                  (progn
+                    (multiple-value-bind (ok msg) (publish-sync r (note alice "dropped" :kind 7))
+                      (check "policy drop -> OK false" (not ok))
+                      (check "policy drop reason" (and msg (search "blocked: test" msg))))
+                    (check "dropped event not stored" (null (by-kind 7)))
+                    (multiple-value-bind (ok) (publish-sync r (note alice "late" :kind 8))
+                      (check "policy delay -> OK true at once" ok))
+                    (check "delayed event not there yet" (null (by-kind 8)))
+                    (check "delayed event stored after the delay"
+                           (wait-until (lambda () (by-kind 8)) :timeout 5))
+                    (let ((since (- (unix-now) 30)))
+                      (publish-sync r (note alice "kept" :kind 20002))
+                      (publish-sync r (note alice "not kept" :kind 20001))
+                      (check "retained ephemeral returned to a since filter"
+                             (= 1 (length (by-kind 20002 :since since))))
+                      (check "retained ephemeral not returned without since" (null (by-kind 20002)))
+                      (check "ephemeral the predicate refuses is not retained" (null (by-kind 20001 :since since)))))
+               (cl-nostr.relay:close-relay r))))
+      (stop-relay relay))))

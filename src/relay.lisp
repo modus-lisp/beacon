@@ -42,10 +42,21 @@
                              (reqs-per-second 50) (req-burst 200)
                              (verify-queue 4096) (query-queue 4096)
                              (name "beacon") (description "A Nostr relay in pure Common Lisp.")
-                             (pubkey nil) (contact nil))))
+                             (pubkey nil) (contact nil)
+                             (event-policy nil) (retain-ephemeral nil) (ephemeral-ttl 600))))
   host port dir io-threads verify-threads query-threads fanout-threads sync fsync-interval-ms max-message max-subscriptions
   max-filters max-connections events-per-second event-burst reqs-per-second req-burst
-  verify-queue query-queue name description pubkey contact)
+  verify-queue query-queue name description pubkey contact
+  ;; EVENT-POLICY: NIL, or a function of a parsed (not yet verified) EVENT, called on
+  ;; an I/O thread.  It returns NIL to accept, :DROP or (:DROP "reason") to refuse
+  ;; with OK false "blocked: reason", or a positive number of seconds to accept now
+  ;; (OK true) and ingest that much later.  For test networks and operator policy.
+  event-policy
+  ;; RETAIN-EPHEMERAL: NIL, or a predicate on an ephemeral event.  Events it accepts
+  ;; are kept in memory for EPHEMERAL-TTL seconds and returned, after the stored
+  ;; results, to REQ filters that set "since".  Off the NIP-01 path: for clients
+  ;; that poll for replies instead of subscribing before they ask.
+  retain-ephemeral ephemeral-ttl)
 
 ;;; ---- statistics ----------------------------------------------------------------------
 
@@ -105,6 +116,8 @@
   (stats (make-stats))
   verify-q writer-q query-q
   (threads '())
+  (retained '())                          ; (arrival-us . event), newest first
+  (retained-lock (sb-thread:make-mutex :name "retained"))
   (running t)
   (fanouts #() :type simple-vector))      ; the fanout shards
 
@@ -159,10 +172,11 @@
   (conn-send c (msg-frame (lambda (b) (obuf-ascii b "[\"NOTICE\",") (obuf-json-string b text) (obuf-byte b 93)))))
 
 (defun send-ok (c id-hex ok message)
-  (conn-send c (msg-frame (lambda (b)
+  ;; C is NIL for an event whose OK was already sent (a delayed one)
+  (when c (conn-send c (msg-frame (lambda (b)
                             (obuf-ascii b "[\"OK\",") (obuf-json-string b id-hex)
                             (obuf-ascii b (if ok ",true," ",false,"))
-                            (obuf-json-string b message) (obuf-byte b 93)))))
+                            (obuf-json-string b message) (obuf-byte b 93))))))
 
 (defun send-closed (c sub-id message)
   (conn-send c (msg-frame (lambda (b)
@@ -289,6 +303,20 @@ and let the fanout thread take it out of the index."
           (when (and s (not (serial-deleted-p (index-columns idx) s)))
             (sb-ext:atomic-incf (stats-duplicates st))
             (return-from handle-event-msg (send-ok c raw-id t "duplicate: already have this event"))))
+        (let* ((policy (config-event-policy (relay-config relay)))
+               (verdict (and policy (handler-case (funcall policy e)
+                                      (error (err) (log-msg 0 "event policy: ~a" err) nil)))))
+          (cond ((null verdict))
+                ((or (eq verdict :drop) (and (consp verdict) (eq (car verdict) :drop)))
+                 (sb-ext:atomic-incf (stats-rejected st))
+                 (return-from handle-event-msg
+                   (send-ok c raw-id nil (format nil "blocked: ~a" (if (consp verdict) (second verdict) "policy")))))
+                ((and (realp verdict) (plusp verdict))
+                 (let ((q (relay-verify-q relay)))
+                   (sb-ext:schedule-timer (sb-ext:make-timer (lambda () (bqueue-push q (list nil e (now-us))))
+                                                             :thread t :name "beacon-delay")
+                                          verdict))
+                 (return-from handle-event-msg (send-ok c raw-id t "")))))
         (unless (bqueue-push (relay-verify-q relay) (list c e t0))
           (sb-ext:atomic-incf (stats-busy st))
           (send-ok c raw-id nil "rate-limited: relay is busy, try again"))))))
@@ -418,6 +446,29 @@ and let the fanout thread take it out of the index."
          (http-response 200 "OK" :body (format nil "~a — a Nostr relay. Connect with a Nostr client.~%" (config-name (relay-config relay)))))
         (t (http-response 405 "Method Not Allowed" :body "method not allowed"))))
 
+;;; ---- retained ephemeral events -------------------------------------------------------------
+
+(defun retain-ephemeral (relay e)
+  "Writer thread: keep E if the config's RETAIN-EPHEMERAL accepts it, and expire old ones."
+  (let* ((cfg (relay-config relay)) (pred (config-retain-ephemeral cfg)))
+    (when (and pred (funcall pred e))
+      (let ((now (now-us)) (cutoff (- (now-us) (* 1000000 (config-ephemeral-ttl cfg)))))
+        (sb-thread:with-mutex ((relay-retained-lock relay))
+          (push (cons now e) (relay-retained relay))
+          (let ((tail (member-if (lambda (x) (< (car x) cutoff)) (relay-retained relay))))
+            (when tail
+              (setf (relay-retained relay) (ldiff (relay-retained relay) tail)))))))))
+
+(defun retained-matches (relay filters)
+  "Retained ephemeral events matching a FILTER that sets since, oldest first."
+  (let ((with-since (remove-if (lambda (f) (zerop (filter-since f))) filters)))
+    (when (and with-since (relay-retained relay))
+      (let* ((cutoff (- (now-us) (* 1000000 (config-ephemeral-ttl (relay-config relay)))))
+             (all (sb-thread:with-mutex ((relay-retained-lock relay)) (copy-list (relay-retained relay)))))
+        (loop for (at . e) in (reverse all)
+              when (and (>= at cutoff) (some (lambda (f) (filter-matches-event-p f e)) with-since))
+                collect e)))))
+
 ;;; ---- pipeline stages ----------------------------------------------------------------------
 
 (defun verify-worker (relay)
@@ -454,7 +505,8 @@ and let the fanout thread take it out of the index."
                        (:stored (sb-ext:atomic-incf (stats-stored st))
                         (loop for fo across (relay-fanouts relay) do (bqueue-push (fanout-q fo) (list :event e detail)))
                         (send-ok c (event-id-hex e) t ""))
-                       (:ephemeral (loop for fo across (relay-fanouts relay) do (bqueue-push (fanout-q fo) (list :event e nil)))
+                       (:ephemeral (retain-ephemeral relay e)
+                        (loop for fo across (relay-fanouts relay) do (bqueue-push (fanout-q fo) (list :event e nil)))
                         (send-ok c (event-id-hex e) t ""))
                        (:duplicate (sb-ext:atomic-incf (stats-duplicates st))
                         (send-ok c (event-id-hex e) t "duplicate: already have this event"))
@@ -533,6 +585,13 @@ crash of the MACHINE can lose up to one interval."
                                (multiple-value-bind (buf start end) (read-event-json store s reader)
                                  (let ((frame (write-event-frame fb (sub-id-json sub) buf start end)))
                                    (conn-send-throttled c (obuf-data frame) :end (obuf-fill frame)))))
+                             ;; after registration, so an ephemeral event is either here or
+                             ;; comes through fanout (rarely both, never neither)
+                             (dolist (e (retained-matches relay (sub-filters sub)))
+                               (when (or (sub-closed sub) (conn-closed c)) (return))
+                               (let* ((json (event-json e))
+                                      (frame (write-event-frame fb (sub-id-json sub) json 0 (length json))))
+                                 (conn-send-throttled c (obuf-data frame) :end (obuf-fill frame))))
                              (unless (sub-closed sub)
                                (conn-send c (eose-frame sub))
                                (record-latency (stats-query-hist st) (sub-t0 sub))

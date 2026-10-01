@@ -378,5 +378,6 @@ boundary, and records (10 KB, 200 KB) larger than a chunk."
   (run-section "store model, 100k events (crosses chunk + resize boundaries)"
                (lambda () (test-store-model :n 100000 :queries 120)))
   (when (and network (fboundp 'run-network-tests)) (run-section "network" 'run-network-tests))
+  (when (and network (fboundp 'run-policy-tests)) (run-section "policy" 'run-policy-tests))
   (format t "~&~d passed, ~d failed~%" *pass* *fail*)
   (zerop *fail*))
