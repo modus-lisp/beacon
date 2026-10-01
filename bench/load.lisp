@@ -115,6 +115,18 @@ on THREADS threads.  Returns a simple-vector of (id-hex . json-octets)."
                                                                   (beacon::string-utf8 (format nil "[\"EVENT\",~a]" json)))))))))))
     out))
 
+;;; The load generator's own pauses inflate what it measures; report them.
+(defvar *client-gcs* 0)
+(defvar *client-gc-max* 0)
+(defvar *client-gc-last* 0)
+(defun note-client-gc ()
+  (let ((ms (/ (* 1000 (- sb-ext:*gc-run-time* *client-gc-last*)) internal-time-units-per-second)))
+    (setf *client-gc-last* sb-ext:*gc-run-time*)
+    (incf *client-gcs*)
+    (setf *client-gc-max* (max *client-gc-max* ms))))
+(setf *client-gc-last* sb-ext:*gc-run-time*)
+(pushnew 'note-client-gc sb-ext:*after-gc-hooks*)
+
 ;;; ---- the load run --------------------------------------------------------------------------------
 
 (defun message-type (payload)
@@ -140,6 +152,7 @@ on THREADS threads.  Returns a simple-vector of (id-hex . json-octets)."
          (r-ok (make-rec "publish -> OK"))
          (r-live (make-rec "publish -> live EVENT"))
          (r-query (make-rec "REQ -> EOSE"))
+         (r-lag (make-rec "client send lag"))
          (rejected 0) (stop nil) (threads '()) (conns '())
          (author-vec (world-authors (make-world :authors authors)))
          (note-ids #()))
@@ -214,15 +227,23 @@ on THREADS threads.  Returns a simple-vector of (id-hex . json-octets)."
                                 (when (> due now) (sleep (/ (- due now) 1d6))))
                               (destructuring-bind (id . frame) (svref events i)
                                 (setf (gethash id sent-at) due)   ; the SCHEDULED time
-                                (ws-send c frame)))))))
-        (sleep seconds)
-        (setf stop t)
+                                (ws-send c frame)
+                                (rec-add r-lag (max 0 (- (now-us) due)))))))))
+        (let ((gc0 sb-ext:*gc-run-time*) (n0 *client-gcs*) (max0 (setf *client-gc-max* 0)))
+          (declare (ignore max0))
+          (sleep seconds)
+          (setf stop t)
+          (format t "~&load generator's own GC: ~d collections, ~,0f ms total, longest ~,0f ms~%"
+                  (- *client-gcs* n0)
+                  (/ (* 1000 (- sb-ext:*gc-run-time* gc0)) internal-time-units-per-second)
+                  *client-gc-max*))
         (sleep 2)
         (format t "~&~d publishers x ~d/s = ~:d events/s offered, ~d listeners, ~d queriers, ~d s~%"
                 publishers publish-rate (* publishers publish-rate) listeners queriers seconds)
         (rec-report r-ok seconds)
         (rec-report r-live seconds)
         (rec-report r-query seconds)
+        (rec-report r-lag seconds)
         (format t "  rejected/failed publishes: ~d~%" rejected)
         (mapc #'ws-close conns)
         (dolist (th threads) (ignore-errors (sb-thread:join-thread th :timeout 2)))))))

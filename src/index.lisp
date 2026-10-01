@@ -34,7 +34,7 @@
 
 (defconstant +blk-shift+ 6)
 (defconstant +blk+ (ash 1 +blk-shift+))     ; entries per block (64)
-(defconstant +promote-at+ 32)               ; a linked list longer than this becomes a plist
+(defconstant +promote-at+ 128)              ; a linked list longer than this becomes a plist
 (defconstant +plist-flag+ (ash 1 61))       ; a posting handle that names a plist
 
 (defconstant +flag-deleted+ 1)
@@ -238,41 +238,61 @@ form, so it is SETF-able; I is evaluated twice, so pass a variable."
   (+ (htab-count (table-ht table)) (let ((o (table-old table))) (if o (htab-count o) 0))))
 
 ;;; ---- plists: long posting lists ----------------------------------------------------
-;;; DATA (chunked) holds serials in insertion order.  Per block of 64 entries,
-;;; BMAX/BMIN are the created_at bounds and PMAX is the running maximum of BMAX
-;;; over blocks 0..b — the newest event anywhere at or before block b.  A
-;;; backwards scan can stop the moment PMAX falls below what it still needs.  The
-;;; block arrays are 1/64 the size of the data, so they are simply grown.
+;;; Serials in insertion order: a plain vector (doubling) up to one chunk, then
+;;; a chunked vector whose chunk 0 IS that vector.  BLOCKS holds three u32 per
+;;; block of 64 entries — the block's max and min created_at, and PMAX, the
+;;; running maximum over blocks 0..b (the newest event anywhere at or before
+;;; block b).  A backwards scan can stop the moment PMAX falls below what it
+;;; still needs.
+;;;
+;;; Three heap objects per list (struct, data, blocks): the collector copies
+;;; every small object it keeps, so the per-list object count is what a full
+;;; collection's pause is made of.
 
 (defstruct (plist (:constructor %make-plist))
-  (data (make-cvec '(unsigned-byte 32) 64) :type cvec)
-  (bmax (u32-vector 1) :type (simple-array (unsigned-byte 32) (*)))
-  (bmin (u32-vector 1) :type (simple-array (unsigned-byte 32) (*)))
-  (pmax (u32-vector 1) :type (simple-array (unsigned-byte 32) (*)))
+  (small (u32-vector 16) :type (simple-array (unsigned-byte 32) (*)))
+  (big nil :type (or null cvec))
+  (blocks (u32-vector 3) :type (simple-array (unsigned-byte 32) (*)))
   (count 0 :type fixnum))
 
 (defun make-plist () (%make-plist))
 
 (declaim (inline plist-ref))
-(defun plist-ref (pl i) (cvref (plist-data pl) i (unsigned-byte 32)))
+(defun plist-ref (pl i)
+  (declare (type plist pl) (type ufix i))
+  (let ((big (plist-big pl)))
+    (if big
+        (cvref big i (unsigned-byte 32))
+        (aref (plist-small pl) i))))
 
 (defun plist-append (pl serial created)
   (declare (type plist pl) (type (unsigned-byte 32) serial created))
   (let* ((c (plist-count pl))
          (b (ash c (- +blk-shift+))))
-    (cvec-ensure (plist-data pl) c)
-    (when (>= b (length (plist-bmax pl)))
-      (let ((nb (* 2 (length (plist-bmax pl)))))
-        (setf (plist-bmax pl) (grow-vector (plist-bmax pl) nb)
-              (plist-bmin pl) (grow-vector (plist-bmin pl) nb)
-              (plist-pmax pl) (grow-vector (plist-pmax pl) nb))))
-    (let ((bmax (plist-bmax pl)) (bmin (plist-bmin pl)) (pmax (plist-pmax pl)))
-      (setf (cvref (plist-data pl) c (unsigned-byte 32)) serial)
+    (cond
+      ((< c +chunk-size+)
+       (when (>= c (length (plist-small pl)))
+         (let ((new (grow-vector (plist-small pl) (min +chunk-size+ (* 2 (length (plist-small pl)))))))
+           (barrier-write)
+           (setf (plist-small pl) new)))
+       (setf (aref (plist-small pl) c) serial))
+      (t
+       (unless (plist-big pl)
+         (let ((cv (%make-cvec :chunks (vector (plist-small pl)) :element-type '(unsigned-byte 32))))
+           (barrier-write)
+           (setf (plist-big pl) cv)))
+       (cvec-ensure (plist-big pl) c)
+       (setf (cvref (plist-big pl) c (unsigned-byte 32)) serial)))
+    (when (>= (* 3 b) (length (plist-blocks pl)))
+      (let ((new (grow-vector (plist-blocks pl) (* 2 (length (plist-blocks pl))))))
+        (barrier-write)
+        (setf (plist-blocks pl) new)))
+    (let ((bl (plist-blocks pl)) (i (* 3 b)))
       (if (zerop (logand c (1- +blk+)))
-          (setf (aref bmax b) created (aref bmin b) created)
-          (setf (aref bmax b) (max created (aref bmax b))
-                (aref bmin b) (min created (aref bmin b))))
-      (setf (aref pmax b) (if (zerop b) (aref bmax b) (max (aref bmax b) (aref pmax (1- b)))))
+          (setf (aref bl i) created (aref bl (+ i 1)) created)
+          (setf (aref bl i) (max created (aref bl i))
+                (aref bl (+ i 1)) (min created (aref bl (+ i 1)))))
+      (setf (aref bl (+ i 2)) (if (zerop b) (aref bl i) (max (aref bl i) (aref bl (- i 1)))))
       (barrier-write)
       (setf (plist-count pl) (1+ c)))))
 

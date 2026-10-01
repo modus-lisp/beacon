@@ -19,7 +19,9 @@
   (index (make-index) :type index)
   (write-lock (sb-thread:make-mutex :name "store-writer"))
   (readers (make-hash-table :test 'eq :weakness :key :synchronized t))
-  (sync t)                        ; fsync each batch
+  (sync :interval)                ; :always — fsync before acknowledging a batch
+                                  ; :interval — the caller fsyncs periodically
+                                  ; :never — leave it to the kernel
   (wbuf (make-obuf 65536))        ; the writer's encode buffer, reused across batches
   (key nil))                      ; the 16-byte SipHash secret
 
@@ -135,13 +137,19 @@ the slot's previous holder is newer; delete the other."
 
 ;;; ---- opening: replay -------------------------------------------------------------------
 
-(defun open-store (dir &key (sync t))
+(defun normalize-sync (sync)
+  (case sync ((t :always) :always) ((nil :never) :never) (:interval :interval)
+    (t (error "sync must be :always, :interval or :never, not ~s" sync))))
+
+(defun open-store (dir &key (sync :always))
   "Open (creating if needed) the store in directory DIR and rebuild the indexes
-from its log."
+from its log.  SYNC: :ALWAYS fsyncs every batch before it is acknowledged;
+:INTERVAL leaves fsync to STORE-FSYNC, called periodically (the relay does);
+:NEVER leaves it to the kernel."
   (let* ((dir (uiop:ensure-directory-pathname dir))
          (_ (ensure-directories-exist dir))
          (key (load-or-create-key dir))
-         (store (%make-store :dir dir :sync sync :key key))
+         (store (%make-store :dir dir :sync (normalize-sync sync) :key key))
          (path (store-log-path dir))
          (t0 (now-us)))
     (declare (ignore _))
@@ -286,7 +294,7 @@ Returns a list parallel to EVENTS of (STATUS . DETAIL):
       (setf accepted (nreverse accepted))
       (when accepted
         (let ((base (event-log-size (store-log store))))
-          (log-append (store-log store) buf :sync (store-sync store))
+          (log-append (store-log store) buf :sync (eq (store-sync store) :always))
           ;; now make them visible, in order
           (loop for (pos e author rkey dids daddrs start len) in accepted do
             (let ((s (index-add idx :off (+ base start) :len len :created (event-created-at e)
@@ -300,6 +308,10 @@ Returns a list parallel to EVENTS of (STATUS . DETAIL):
       (when (> (length (obuf-data buf)) (* 64 1024 1024)) (setf (store-wbuf store) (make-obuf 65536)))
       (coerce results 'list))))
 
+(defun store-fsync (store)
+  "Make everything written so far durable.  Safe to call from any thread."
+  (let ((log (store-log store))) (when log (log-fsync-written log))))
+
 (defun store-insert (store event)
   "Insert one verified EVENT.  See STORE-INSERT-BATCH."
   (first (store-insert-batch store (list event))))
@@ -309,7 +321,7 @@ Returns a list parallel to EVENTS of (STATUS . DETAIL):
   (sb-thread:with-mutex ((store-write-lock store))
     (let ((buf (make-obuf 256)) (idx (store-index store)))
       (dolist (id ids) (encode-tombstone-record buf id))
-      (log-append (store-log store) buf :sync (store-sync store))
+      (log-append (store-log store) buf :sync (eq (store-sync store) :always))
       (dolist (id ids)
         (table-put (index-deleted-ids idx) (keyed-hash id) +deleted-by-operator+)
         (let ((s (index-find-id idx id))) (when s (index-delete idx s)))))))

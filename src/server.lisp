@@ -40,6 +40,10 @@
   (conns (make-array 64 :adjustable t :fill-pointer 0))
   (lock (sb-thread:make-mutex :name "iothread"))
   (incoming '())                       ; new connections to adopt
+  (busy-max 0 :type fixnum)            ; longest loop iteration (us), for /stats
+  (busy-since 0 :type fixnum)          ; when the current iteration began, 0 while in poll
+  (busy-hist (make-array 32 :element-type 'sb-ext:word :initial-element 0)
+   :type (simple-array sb-ext:word (*)))
   (dirty '()))                         ; connections with queued output / a pending close
 
 (defstruct (conn (:constructor %make-conn))
@@ -90,30 +94,40 @@ Returns NIL if the connection failed."
                  (unless (conn-out-head c) (setf (conn-out-tail c) nil))))))
         finally (return t)))
 
-(defun conn-send (c octets)
-  "Queue OCTETS (a complete frame or HTTP response) for C, writing immediately
-when possible.  Returns NIL if C is closed.  Safe from any thread."
-  (declare (type octets octets))
+(defun conn-send-region (c buf start end)
+  "Send BUF[START,END) (a complete frame or HTTP response) to C, writing
+immediately when nothing is queued ahead of it.  Bytes the kernel does not
+take are COPIED into the queue, so BUF may be a scratch buffer the caller
+reuses: in the common case a send allocates nothing.  Returns NIL if C is
+closed.  Safe from any thread."
+  (declare (type octets buf) (type ufix start end))
   (sb-thread:with-mutex ((conn-out-lock c))
-    (when (or (conn-closed c) (conn-kill c)) (return-from conn-send nil))
-    (let ((cell (list octets)))
-      (if (conn-out-tail c)
-          (setf (cdr (conn-out-tail c)) cell (conn-out-tail c) cell)
-          (setf (conn-out-head c) cell (conn-out-tail c) cell)))
-    (incf (conn-out-bytes c) (length octets))
-    (let ((was-only (null (cdr (conn-out-head c)))))
-      ;; nothing ahead of us: go straight to the socket
-      (when (and was-only (not (%write-queue c)))
-        (setf (conn-kill c) t)))
-    (cond ((> (conn-out-bytes c) (server-max-out-bytes (iothread-server (conn-io c))))
-           (setf (conn-kill c) t)
-           (%mark-dirty c))
-          ((or (conn-out-head c) (conn-kill c)) (%mark-dirty c)))
+    (when (or (conn-closed c) (conn-kill c)) (return-from conn-send-region nil))
+    (when (null (conn-out-head c))
+      ;; nothing ahead of us: straight to the socket
+      (let ((n (fd-write (conn-fd c) buf start end)))
+        (cond ((eq n :error) (setf (conn-kill c) t) (%mark-dirty c) (return-from conn-send-region t))
+              ((integerp n) (incf start n)))))
+    (when (< start end)
+      (let ((cell (list (subseq buf start end))))
+        (if (conn-out-tail c)
+            (setf (cdr (conn-out-tail c)) cell (conn-out-tail c) cell)
+            (setf (conn-out-head c) cell (conn-out-tail c) cell))
+        (setf (conn-out-pos c) (if (eq (conn-out-head c) cell) 0 (conn-out-pos c)))
+        (incf (conn-out-bytes c) (- end start)))
+      (when (> (conn-out-bytes c) (server-max-out-bytes (iothread-server (conn-io c))))
+        (setf (conn-kill c) t))
+      (%mark-dirty c))
     t))
 
-(defun conn-send-throttled (c octets &key (high-water (* 4 1024 1024)) (timeout 30))
-  "CONN-SEND for bulk output (query results): first wait, briefly, for the
-client to drain below HIGH-WATER, instead of buffering without bound."
+(defun conn-send (c octets)
+  "CONN-SEND-REGION of all of OCTETS."
+  (conn-send-region c octets 0 (length octets)))
+
+(defun conn-send-throttled (c buf &key (start 0) (end (length buf))
+                                     (high-water (* 4 1024 1024)) (timeout 30))
+  "CONN-SEND-REGION for bulk output (query results): first wait, briefly, for
+the client to drain below HIGH-WATER, instead of buffering without bound."
   (let ((deadline (+ (get-internal-real-time) (* timeout internal-time-units-per-second))))
     (loop while (and (> (conn-out-bytes c) high-water) (not (conn-closed c)) (not (conn-kill c)))
           do (when (> (get-internal-real-time) deadline)
@@ -121,7 +135,7 @@ client to drain below HIGH-WATER, instead of buffering without bound."
                (%mark-dirty c)
                (return-from conn-send-throttled nil))
              (sleep 0.001)))
-  (conn-send c octets))
+  (conn-send-region c buf start end))
 
 (defun conn-close-after-flush (c)
   (sb-thread:with-mutex ((conn-out-lock c)) (setf (conn-closing c) t))
@@ -275,6 +289,8 @@ client to drain below HIGH-WATER, instead of buffering without bound."
               do (pollset-add ps (conn-fd c) (if (conn-out-head c) (logior +pollin+ +pollout+) +pollin+))
                  (vector-push-extend c slots))
       (pollset-wait ps 1000)
+      (let ((t-busy (now-us)))
+      (setf (iothread-busy-since io) t-busy)
       (unless (zerop (pollset-revents ps 0)) (drain-waker (iothread-waker io)))
       ;; adopt new connections, finish others' sends
       (let (incoming dirty)
@@ -300,7 +316,12 @@ client to drain below HIGH-WATER, instead of buffering without bound."
                    (error (e) (log-msg 0 "conn ~d: ~a" (conn-id c) e) (%close-conn io c "internal error"))))
       (when (/= last-housekeeping (get-universal-time))
         (setf last-housekeeping (get-universal-time))
-        (%housekeeping io)))
+        (%housekeeping io))
+      ;; how long the thread was away from poll(2): its connections waited that long
+      (setf (iothread-busy-since io) 0)
+      (let ((us (max 1 (- (now-us) t-busy))))
+        (setf (iothread-busy-max io) (max (iothread-busy-max io) us))
+        (incf (aref (iothread-busy-hist io) (min 31 (1- (integer-length us))))))))
     ;; shutting down
     (loop for c across (iothread-conns io) do (%close-conn io c "server stopping"))))
 

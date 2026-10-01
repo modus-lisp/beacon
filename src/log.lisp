@@ -94,16 +94,19 @@ of [\"d\", d], so a filter's #d values name replaceable slots directly."
 (defun rec-kind (r o) (get-u16 r (+ o 12)))
 (defun rec-expiration (r o) (get-u32 r (+ o 16)))
 (defun rec-json-length (r o) (get-u32 r (+ o 20)))
-(defun rec-dhash (r o) (get-u64 r (+ o 88)))
+;;; Hashes are 62 bits in memory (see KEYED-HASH); masking on read keeps any
+;;; header value — including logs written with full 64-bit hashes — in range.
+(defun rec-dhash (r o) (ldb (byte 62 0) (get-u64 r (+ o 88))))
 (defun rec-json-start (r o) (+ o +rec-header+ (* 8 (rec-ntags r o))))
-(defun rec-tag-hash (r o i) (get-u64 r (+ o +rec-header+ (* 8 i))))
+(defun rec-tag-hash (r o i) (ldb (byte 62 0) (get-u64 r (+ o +rec-header+ (* 8 i)))))
 
 ;;; ---- the writer side ---------------------------------------------------------
 
 (defstruct (event-log (:constructor %make-event-log))
   (path nil)
   (out nil)                        ; output fd-stream, appending
-  (size 0 :type (integer 0)))      ; bytes durably framed so far (= next offset)
+  (size 0 :type (integer 0))       ; bytes written so far (= next offset)
+  (synced 0 :type (integer 0)))    ; bytes known to be on stable storage
 
 (defun fd-of (stream) (sb-sys:fd-stream-fd stream))
 
@@ -113,12 +116,20 @@ returning — the group commit point."
   (let ((out (event-log-out log)))
     (write-sequence (obuf-data b) out :end (obuf-fill b))
     (finish-output out)
-    (when sync (sb-posix:fsync (fd-of out)))
-    (incf (event-log-size log) (obuf-fill b))))
+    (incf (event-log-size log) (obuf-fill b))
+    (when sync
+      (sb-posix:fsync (fd-of out))
+      (setf (event-log-synced log) (event-log-size log)))))
 
-(defun log-sync (log)
-  (finish-output (event-log-out log))
-  (sb-posix:fsync (fd-of (event-log-out log))))
+(defun log-fsync-written (log)
+  "fsync whatever has been WRITTEN (LOG-APPEND always finishes output, so the
+bytes are in the kernel).  Touches only the fd, never the stream, so it is safe
+from a thread other than the writer.  Returns the number of bytes it covered."
+  (let ((size (event-log-size log)) (out (event-log-out log)))
+    (when (and out (> size (event-log-synced log)))
+      (sb-posix:fsync (fd-of out))
+      (prog1 (- size (event-log-synced log))
+        (setf (event-log-synced log) size)))))
 
 (defun close-event-log (log)
   (when (event-log-out log)

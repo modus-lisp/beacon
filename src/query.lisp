@@ -72,7 +72,7 @@
 
 (defstruct (cfilter (:constructor %make-cfilter))
   (filter nil)
-  (kinds nil)                     ; bit-vector 65536 or NIL
+  (kinds nil)                     ; list of kinds or NIL
   (authors nil)                   ; hash-set of author hashes or NIL
   (tags nil)                      ; list of (simple-array u64) — one per tag condition
   (since 0) (until #xffffffff)
@@ -81,11 +81,9 @@
 (defun compile-filter (f)
   (%make-cfilter
    :filter f
-   :kinds (when (filter-kinds f)
-            (let ((bv (make-array 65536 :element-type 'bit :initial-element 0)))
-              (dolist (k (filter-kinds f) bv) (setf (sbit bv k) 1))))
+   :kinds (filter-kinds f)
    :authors (when (filter-authors f)
-              (let ((h (make-hash-table :test 'eql)))
+              (let ((h (make-hash-table :test 'eql :size (* 2 (length (filter-authors f))))))
                 (dolist (a (filter-authors f) h) (setf (gethash (keyed-hash a) h) t))))
    :tags (mapcar #'cdr (filter-tags f))
    :since (filter-since f) :until (filter-until f)
@@ -99,7 +97,7 @@
     (and (not (serial-deleted-p cols serial))
          (or (zerop exp) (> exp now))
          (<= (cfilter-since cf) created (cfilter-until cf))
-         (or (null (cfilter-kinds cf)) (= 1 (sbit (cfilter-kinds cf) (col-kind cols serial))))
+         (or (null (cfilter-kinds cf)) (member (col-kind cols serial) (cfilter-kinds cf)))
          (or (null (cfilter-authors cf)) (gethash (col-author cols serial) (cfilter-authors cf))))))
 
 (defun record-tags-match-p (store serial tag-sets)
@@ -195,14 +193,17 @@ them as a list (newest first), or with COUNT-ONLY their number."
                  (scan-plist (pl)
                    ;; newest blocks first; stop when nothing older can qualify
                    (let* ((n (prog1 (plist-count pl) (barrier-read)))
-                          (bmax (plist-bmax pl)) (bmin (plist-bmin pl)) (pmax (plist-pmax pl)))
-                     (loop for b from (ash (1- n) (- +blk-shift+)) downto 0 do
+                          (bl (plist-blocks pl)))
+                     (loop for b from (ash (1- n) (- +blk-shift+)) downto 0
+                           for bmax = (aref bl (* 3 b)) for bmin = (aref bl (+ 1 (* 3 b)))
+                           for pmax = (aref bl (+ 2 (* 3 b)))
+                           do
                        (let ((floor (if count-only nil (topk-floor heap))))
-                         (when (or (< (aref pmax b) (cfilter-since cf))
-                                   (and floor (< (aref pmax b) floor)))
+                         (when (or (< pmax (cfilter-since cf))
+                                   (and floor (< pmax floor)))
                            (return)))
-                       (unless (or (> (aref bmin b) (cfilter-until cf))
-                                   (< (aref bmax b) (cfilter-since cf)))
+                       (unless (or (> bmin (cfilter-until cf))
+                                   (< bmax (cfilter-since cf)))
                          (loop for i from (min (1- n) (+ (ash b +blk-shift+) (1- +blk+)))
                                  downto (ash b +blk-shift+)
                                do (unless (budget-left-p) (return-from scan-plist))
@@ -221,7 +222,7 @@ them as a list (newest first), or with COUNT-ONLY their number."
                         (when (plusp v) (consider (1- v))))))
             (:postings
              (let ((p (car items)) (hs (cdr items)))
-               (when (> (count-if-not #'zerop hs) 1) (setf seen (make-hash-table :test 'eql)))
+               (when (> (count-if-not #'zerop hs) 1) (setf seen (make-hash-table :test 'eql :size 256)))
                (dolist (h hs) (scan-handle p h))))
             ((:kinds :all) (dolist (pl items) (scan-plist pl)))))))
     (if count-only
@@ -246,11 +247,13 @@ them as a list (newest first), or with COUNT-ONLY their number."
 (defun store-query (store filters &key (snapshot (index-count (store-index store))) (now (unix-now)))
   "Serials matching any of FILTERS, newest first, each filter contributing at
 most its LIMIT, without duplicates."
-  (let ((seen (make-hash-table :test 'eql)) (all '())
+  (let ((seen (and (cdr filters) (make-hash-table :test 'eql :size 256))) (all '())
         (cols (index-columns (store-index store))))
     (dolist (f filters)
       (dolist (s (run-filter store f snapshot :now now))
-        (unless (gethash s seen) (setf (gethash s seen) t) (push s all))))
+        (unless (and seen (gethash s seen))
+          (when seen (setf (gethash s seen) t))
+          (push s all))))
     (if (cdr filters)
         (sort all (lambda (a b) (let ((ca (col-created cols a)) (cb (col-created cols b)))
                                   (or (> ca cb) (and (= ca cb) (> a b))))))
