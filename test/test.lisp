@@ -367,6 +367,21 @@ boundary, and records (10 KB, 200 KB) larger than a chunk."
   (handler-case (funcall fn)
     (error (c) (incf *fail*) (format t "~&FAIL: section ~a died: ~a~%" name c))))
 
+(defun test-huge-limit ()
+  "A LIMIT far above the result size costs the result, not the limit (the top-k grows)."
+  (let* ((dir (fresh-dir "huge-limit")) (store (open-store dir :sync nil)) (a (make-test-key 7)) (now (unix-now))
+         (jsons (loop for i below 5000 collect (sign-event-json a 1 (format nil "e~d" i) :created-at (- now i) :fake-sig t))))
+    (unwind-protect
+         (let ((beacon::*max-limit* 100000000) (beacon::*default-limit* 100000000))
+           (insert-json store jsons)
+           (let ((events (mapcar #'parse-event-json jsons))
+                 (bytes-before (sb-ext:get-bytes-consed)))
+             (let ((got (q store "{\"kinds\":[1]}")))
+               (check "huge limit: every event, newest first" (equal got (model-query events "{\"kinds\":[1]}")))
+               (check "huge limit: allocation is not the limit's size"
+                      (< (- (sb-ext:get-bytes-consed) bytes-before) (* 50 1024 1024))))))
+      (close-store store))))
+
 (defun run (&key (network t))
   (setf *pass* 0 *fail* 0)
   (run-section "primitives" #'test-primitives)
@@ -375,6 +390,7 @@ boundary, and records (10 KB, 200 KB) larger than a chunk."
   (run-section "store semantics" #'test-store-semantics)
   (run-section "index structures" #'test-index-structures)
   (run-section "store model" #'test-store-model)
+  (run-section "huge limit" #'test-huge-limit)
   (run-section "store model, 100k events (crosses chunk + resize boundaries)"
                (lambda () (test-store-model :n 100000 :queries 120)))
   (when (and network (fboundp 'run-network-tests)) (run-section "network" 'run-network-tests))

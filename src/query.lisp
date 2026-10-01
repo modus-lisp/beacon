@@ -32,7 +32,16 @@
   (n 0 :type fixnum)
   (k 0 :type fixnum))
 
-(defun make-topk (k) (%make-topk :created (u32-vector (max 1 k)) :serial (u32-vector (max 1 k)) :k k))
+;; The arrays start small and double up to K: a large LIMIT must not cost its full
+;; size up front (a 100M limit preallocated 800 MB per query and exhausted the heap).
+(defun make-topk (k)
+  (let ((n (max 1 (min k 1024)))) (%make-topk :created (u32-vector n) :serial (u32-vector n) :k k)))
+
+(defun topk-grow (h)
+  (let* ((old (length (topk-created h))) (new (min (topk-k h) (* 2 old)))
+         (cs (u32-vector new)) (ss (u32-vector new)))
+    (replace cs (topk-created h)) (replace ss (topk-serial h))
+    (setf (topk-created h) cs (topk-serial h) ss)))
 
 (declaim (inline topk-less))
 (defun topk-less (c1 s1 c2 s2) (or (< c1 c2) (and (= c1 c2) (< s1 s2))))
@@ -45,6 +54,8 @@
            (topk-less (aref (topk-created h) 0) (aref (topk-serial h) 0) created serial))))
 
 (defun topk-push (h created serial)
+  (when (and (not (topk-full-p h)) (>= (topk-n h) (length (topk-created h))))
+    (topk-grow h))
   (let ((cs (topk-created h)) (ss (topk-serial h)))
     (flet ((swap (i j) (rotatef (aref cs i) (aref cs j)) (rotatef (aref ss i) (aref ss j)))
            (less (i j) (topk-less (aref cs i) (aref ss i) (aref cs j) (aref ss j))))
