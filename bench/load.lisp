@@ -142,7 +142,7 @@ on THREADS threads.  Returns a simple-vector of (id-hex . json-octets)."
 
 (defun load-run (&key (host "127.0.0.1") (port 7777)
                       (publishers 8) (publish-rate 500) (listeners 50) (queriers 16)
-                      (seconds 30) (keys 2000) (authors 200000) (query-mix :default))
+                      (seconds 30) (keys 2000) (authors 200000) (query-mix :default) (firehose 1/2))
   "Total publish rate is PUBLISHERS x PUBLISH-RATE events/s."
   (let* ((nevents (* publishers publish-rate (+ seconds 2)))
          (t-sign (now-us))
@@ -157,6 +157,10 @@ on THREADS threads.  Returns a simple-vector of (id-hex . json-octets)."
          (author-vec (world-authors (make-world :authors authors)))
          (note-ids #()))
     (format t "~&signed ~:d events in ~,1f s~%" nevents (/ (- (now-us) t-sign) 1d6))
+    ;; the generator must not be what it measures: settle the signed events into
+    ;; an old generation and collect rarely
+    (sb-ext:gc :full t)
+    (setf (sb-ext:bytes-consed-between-gcs) (* 2 1024 1024 1024))
     ;; some real note ids from the store, for thread queries
     (let ((c (ws-connect host port)))
       (ws-send-string c "[\"REQ\",\"ids\",{\"kinds\":[1],\"limit\":2000}]")
@@ -169,7 +173,7 @@ on THREADS threads.  Returns a simple-vector of (id-hex . json-octets)."
       ;; listeners: half firehose, half on a slice of the publishing authors
       (dotimes (i listeners)
         (let ((c (open-conn)) (i i))
-          (ws-send-string c (if (evenp i)
+          (ws-send-string c (if (< (mod (* i firehose) 1) firehose)
                                 (format nil "[\"REQ\",\"live\",{\"kinds\":[1],\"limit\":0}]")
                                 (format nil "[\"REQ\",\"live\",{\"authors\":[~{\"~a\"~^,~}],\"limit\":0}]"
                                         (loop for k from 0 below 50
@@ -245,5 +249,7 @@ on THREADS threads.  Returns a simple-vector of (id-hex . json-octets)."
         (rec-report r-query seconds)
         (rec-report r-lag seconds)
         (format t "  rejected/failed publishes: ~d~%" rejected)
+        (finish-output)
         (mapc #'ws-close conns)
-        (dolist (th threads) (ignore-errors (sb-thread:join-thread th :timeout 2)))))))
+        ;; reader threads blocked in read-byte do not all notice a closed socket; don't wait on them
+        (sb-ext:exit :code 0 :abort t)))))

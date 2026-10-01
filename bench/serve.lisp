@@ -6,11 +6,11 @@
 (require :sb-sprof)
 (in-package #:beacon.bench)
 (defun serve (&key (dir "/tmp/beacon-bench/") (port 47777) (io-threads 8) (verify-threads 32)
-                   (query-threads 16) (sync :interval))
+                   (query-threads 16) (fanout-threads 4) (sync :interval))
   (setf (sb-ext:bytes-consed-between-gcs) (* 256 1024 1024))
   (let ((relay (beacon:start-relay
                 (beacon:make-config :port port :dir dir :io-threads io-threads :verify-threads verify-threads
-                                    :query-threads query-threads :sync sync
+                                    :query-threads query-threads :fanout-threads fanout-threads :sync sync
                                     :events-per-second 1000000 :event-burst 1000000
                                     :reqs-per-second 1000000 :req-burst 1000000))))
     ;; watchdog: show what an I/O thread is doing when an iteration runs long

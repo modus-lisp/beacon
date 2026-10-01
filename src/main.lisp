@@ -4,7 +4,7 @@
 ;;;;   beacon compact --dir D      rewrite D's log without dead events (offline)
 ;;;;
 ;;;; Options: --host H  --port P  --dir D  --io-threads N  --verify-threads N
-;;;;          --query-threads N  --fsync always|interval|never  --fsync-interval-ms N
+;;;;          --query-threads N  --fanout-threads N  --fsync always|interval|never  --fsync-interval-ms N
 ;;;;          --name S  --description S
 ;;;;          --pubkey HEX  --contact S  --events-per-second N  --event-burst N
 ;;;;          --max-connections N  --log-level 0|1|2
@@ -25,6 +25,7 @@
             ((string= a "--io-threads") (setf (getf plist :io-threads) (int)))
             ((string= a "--verify-threads") (setf (getf plist :verify-threads) (int)))
             ((string= a "--query-threads") (setf (getf plist :query-threads) (int)))
+            ((string= a "--fanout-threads") (setf (getf plist :fanout-threads) (int)))
             ((string= a "--no-fsync") (setf (getf plist :sync) :never))
             ((string= a "--fsync")
              (setf (getf plist :sync) (let ((v (val)))

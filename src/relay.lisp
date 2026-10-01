@@ -35,7 +35,7 @@
 
 (defstruct (config (:constructor make-config
                        (&key (host "127.0.0.1") (port 7777) (dir "./beacon-data/")
-                             (io-threads 4) (verify-threads 4) (query-threads 4)
+                             (io-threads 4) (verify-threads 4) (query-threads 4) (fanout-threads 2)
                              (sync :interval) (fsync-interval-ms 50) (max-message (* 512 1024)) (max-subscriptions 50)
                              (max-filters 20) (max-connections 20000)
                              (events-per-second 50) (event-burst 200)
@@ -43,7 +43,7 @@
                              (verify-queue 4096) (query-queue 4096)
                              (name "beacon") (description "A Nostr relay in pure Common Lisp.")
                              (pubkey nil) (contact nil))))
-  host port dir io-threads verify-threads query-threads sync fsync-interval-ms max-message max-subscriptions
+  host port dir io-threads verify-threads query-threads fanout-threads sync fsync-interval-ms max-message max-subscriptions
   max-filters max-connections events-per-second event-burst reqs-per-second req-burst
   verify-queue query-queue name description pubkey contact)
 
@@ -103,17 +103,29 @@
 (defstruct (relay (:constructor %make-relay))
   config store server
   (stats (make-stats))
-  verify-q writer-q query-q fanout-q
+  verify-q writer-q query-q
   (threads '())
   (running t)
-  ;; the live-subscription index: owned by the fanout thread, no lock
+  (fanouts #() :type simple-vector))      ; the fanout shards
+
+;;; A FANOUT shard owns the live subscriptions of the connections assigned to
+;;; it (by connection id) and sees EVERY stored event, in serial order.  Each
+;;; shard therefore has its own FANNED, and a subscription's snapshot comes from
+;;; its own shard.  Sharding by connection keeps each connection's events in
+;;; order while matching and socket writes run on several threads.
+(defstruct (fanout (:constructor %make-fanout))
+  (q (make-bqueue))
   (by-id (make-hash-table :test 'eql))
   (by-author (make-hash-table :test 'eql))
   (by-tag (make-hash-table :test 'eql))
   (by-kind (make-array 65536 :initial-element nil))
   (wildcard '())
   (fanned 0 :type fixnum)
-  (fanout-seq 0 :type fixnum))
+  (seq 0 :type fixnum))
+
+(defun sub-fanout (relay sub)
+  (let ((fos (relay-fanouts relay)))
+    (svref fos (mod (conn-id (sub-conn sub)) (length fos)))))
 
 (defstruct (cstate (:constructor make-cstate))
   (subs (make-hash-table :test 'equal))
@@ -199,7 +211,7 @@ reuse B, so delivering an event allocates nothing unless the socket is full."
 (declaim (inline hkey))
 (defun hkey (h) h)                      ; hashes are already fixnums
 
-(defun register-sub (relay sub)
+(defun register-sub (fo sub)
   "Index SUB's filters for fanout.  Fanout thread only."
   (dolist (f (sub-filters sub))
     (unless (filter-impossible f)
@@ -208,29 +220,29 @@ reuse B, so delivering an event allocates nothing unless the socket is full."
                  (push entry (gethash key table))
                  (push (list table key entry) (sub-regs sub))))
           (cond
-            ((filter-ids f) (dolist (id (filter-ids f)) (add (relay-by-id relay) (hkey (keyed-hash id)))))
-            ((filter-tags f) (loop for h across (cdr (first (filter-tags f))) do (add (relay-by-tag relay) (hkey h))))
-            ((filter-authors f) (dolist (a (filter-authors f)) (add (relay-by-author relay) (hkey (keyed-hash a)))))
+            ((filter-ids f) (dolist (id (filter-ids f)) (add (fanout-by-id fo) (hkey (keyed-hash id)))))
+            ((filter-tags f) (loop for h across (cdr (first (filter-tags f))) do (add (fanout-by-tag fo) (hkey h))))
+            ((filter-authors f) (dolist (a (filter-authors f)) (add (fanout-by-author fo) (hkey (keyed-hash a)))))
             ((filter-kinds f)
              (dolist (k (filter-kinds f))
-               (push entry (svref (relay-by-kind relay) k))
+               (push entry (svref (fanout-by-kind fo) k))
                (push (list :kind k entry) (sub-regs sub))))
-            (t (push entry (relay-wildcard relay))
+            (t (push entry (fanout-wildcard fo))
                (push (list :wildcard nil entry) (sub-regs sub)))))))))
 
-(defun unregister-sub (relay sub)
+(defun unregister-sub (fo sub)
   "Fanout thread only."
   (loop for (table key entry) in (sub-regs sub) do
     (case table
-      (:kind (setf (svref (relay-by-kind relay) key) (delete entry (svref (relay-by-kind relay) key) :test #'eq)))
-      (:wildcard (setf (relay-wildcard relay) (delete entry (relay-wildcard relay) :test #'eq)))
+      (:kind (setf (svref (fanout-by-kind fo) key) (delete entry (svref (fanout-by-kind fo) key) :test #'eq)))
+      (:wildcard (setf (fanout-wildcard fo) (delete entry (fanout-wildcard fo) :test #'eq)))
       (t (let ((rest (delete entry (gethash key table) :test #'eq)))
            (if rest (setf (gethash key table) rest) (remhash key table))))))
   (setf (sub-regs sub) '() (sub-pending sub) '() (sub-npending sub) 0))
 
-(defun matching-subs (relay e)
+(defun matching-subs (fo e)
   "Open subscriptions with a filter matching E, each once.  Fanout thread only."
-  (let ((seq (incf (relay-fanout-seq relay))) (out '()))
+  (let ((seq (incf (fanout-seq fo))) (out '()))
     (flet ((try (entries)
              (dolist (entry entries)
                (let ((sub (cdr entry)))
@@ -238,11 +250,11 @@ reuse B, so delivering an event allocates nothing unless the socket is full."
                             (filter-matches-event-p (car entry) e))
                    (setf (sub-seen sub) seq)
                    (push sub out))))))
-      (try (gethash (hkey (keyed-hash (event-id e))) (relay-by-id relay)))
-      (try (gethash (hkey (keyed-hash (event-pubkey e))) (relay-by-author relay)))
-      (loop for h across (event-tag-hashes e) do (try (gethash (hkey h) (relay-by-tag relay))))
-      (try (svref (relay-by-kind relay) (event-kind e)))
-      (try (relay-wildcard relay)))
+      (try (gethash (hkey (keyed-hash (event-id e))) (fanout-by-id fo)))
+      (try (gethash (hkey (keyed-hash (event-pubkey e))) (fanout-by-author fo)))
+      (loop for h across (event-tag-hashes e) do (try (gethash (hkey h) (fanout-by-tag fo))))
+      (try (svref (fanout-by-kind fo) (event-kind e)))
+      (try (fanout-wildcard fo)))
     out))
 
 ;;; ---- protocol: the I/O-thread side --------------------------------------------------------
@@ -251,7 +263,7 @@ reuse B, so delivering an event allocates nothing unless the socket is full."
   "Close SUB from any thread: flag it (fanout and the query worker stop at once)
 and let the fanout thread take it out of the index."
   (setf (sub-closed sub) t)
-  (bqueue-push (relay-fanout-q relay) (list :unregister sub)))
+  (bqueue-push (fanout-q (sub-fanout relay sub)) (list :unregister sub)))
 
 (defun close-sub (relay c sub-id)
   (let* ((cs (conn-user c)) (sub (gethash sub-id (cstate-subs cs))))
@@ -440,9 +452,9 @@ and let the fanout thread take it out of the index."
                   for (status . detail) in results
                   do (ecase status
                        (:stored (sb-ext:atomic-incf (stats-stored st))
-                        (bqueue-push (relay-fanout-q relay) (list :event e detail))
+                        (loop for fo across (relay-fanouts relay) do (bqueue-push (fanout-q fo) (list :event e detail)))
                         (send-ok c (event-id-hex e) t ""))
-                       (:ephemeral (bqueue-push (relay-fanout-q relay) (list :event e nil))
+                       (:ephemeral (loop for fo across (relay-fanouts relay) do (bqueue-push (fanout-q fo) (list :event e nil)))
                         (send-ok c (event-id-hex e) t ""))
                        (:duplicate (sb-ext:atomic-incf (stats-duplicates st))
                         (send-ok c (event-id-hex e) t "duplicate: already have this event"))
@@ -450,16 +462,16 @@ and let the fanout thread take it out of the index."
                         (send-ok c (event-id-hex e) nil detail)))
                      (record-latency (stats-ingest-hist st) t0))))))))
 
-(defun fanout-loop (relay)
+(defun fanout-loop (relay fo)
   (let ((st (relay-stats relay)) (fb (make-obuf 4096)))
-    (loop while (or (relay-running relay) (plusp (bqueue-count (relay-fanout-q relay)))) do
-      (dolist (item (bqueue-pop-batch (relay-fanout-q relay) :max 1024 :timeout 0.5))
+    (loop while (or (relay-running relay) (plusp (bqueue-count (fanout-q fo)))) do
+      (dolist (item (bqueue-pop-batch (fanout-q fo) :max 1024 :timeout 0.5))
         (handler-case
             (ecase (first item)
               (:event
                (destructuring-bind (e serial) (rest item)
                  (let ((json (event-json e)))
-                   (dolist (sub (matching-subs relay e))
+                   (dolist (sub (matching-subs fo e))
                      (let ((frame (write-event-frame fb (sub-id-json sub) json 0 (length json))))
                        (ecase (sub-state sub)
                          (:live (conn-send-region (sub-conn sub) (obuf-data frame) 0 (obuf-fill frame))
@@ -468,18 +480,18 @@ and let the fanout thread take it out of the index."
                           (if (< (sub-npending sub) *max-pending*)
                               (progn (push (obuf-copy frame) (sub-pending sub)) (incf (sub-npending sub)))
                               (conn-kill-now (sub-conn sub))))))))
-                 (when serial (setf (relay-fanned relay) (1+ serial)))))
+                 (when serial (setf (fanout-fanned fo) (1+ serial)))))
               (:register
                (let ((sub (second item)))
-                 (unless (sub-closed sub) (register-sub relay sub))
-                 (setf (sub-snapshot sub) (relay-fanned relay))
+                 (unless (sub-closed sub) (register-sub fo sub))
+                 (setf (sub-snapshot sub) (fanout-fanned fo))
                  (sb-thread:signal-semaphore (sub-registered sub))))
               (:live
                (let ((sub (second item)))
                  (unless (sub-closed sub)
                    (dolist (frame (nreverse (sub-pending sub))) (conn-send (sub-conn sub) frame))
                    (setf (sub-pending sub) '() (sub-npending sub) 0 (sub-state sub) :live))))
-              (:unregister (unregister-sub relay (second item))))
+              (:unregister (unregister-sub fo (second item))))
           (error (err) (log-msg 0 "fanout: ~a" err)))))))
 
 (defun fsync-loop (relay)
@@ -512,7 +524,7 @@ crash of the MACHINE can lose up to one interval."
                     (:req
                      (sb-ext:atomic-incf (stats-reqs st))
                      (unless (sub-closed sub)
-                       (bqueue-push (relay-fanout-q relay) (list :register sub))
+                       (bqueue-push (fanout-q (sub-fanout relay sub)) (list :register sub))
                        (if (not (sb-thread:wait-on-semaphore (sub-registered sub) :timeout 30))
                            (send-closed c (sub-id sub) "error: relay overloaded")
                            (let ((reader (store-reader store)))
@@ -524,7 +536,7 @@ crash of the MACHINE can lose up to one interval."
                              (unless (sub-closed sub)
                                (conn-send c (eose-frame sub))
                                (record-latency (stats-query-hist st) (sub-t0 sub))
-                               (bqueue-push (relay-fanout-q relay) (list :live sub))))))))
+                               (bqueue-push (fanout-q (sub-fanout relay sub)) (list :live sub))))))))
                 (error (err)
                   (log-msg 0 "query failed: ~a" err)
                   (send-closed c (sub-id sub) "error: query failed"))))))))))
@@ -538,8 +550,9 @@ crash of the MACHINE can lose up to one interval."
                              :verify-q (make-bqueue :limit (config-verify-queue config))
                              :writer-q (make-bqueue)
                              :query-q (make-bqueue :limit (config-query-queue config))
-                             :fanout-q (make-bqueue))))
-    (setf (relay-fanned relay) (index-count (store-index store)))
+                             :fanouts (coerce (loop repeat (config-fanout-threads config)
+                                                    collect (%make-fanout :fanned (index-count (store-index store))))
+                                              'simple-vector))))
     ;; settle the freshly built index into the oldest generation now, so the
     ;; collections that happen while serving do not keep copying it
     (sb-ext:gc :full t)
@@ -552,7 +565,10 @@ crash of the MACHINE can lose up to one interval."
       (dotimes (i (config-query-threads config)) (spawn (format nil "beacon-query-~d" i) #'query-worker))
       (spawn "beacon-writer" #'writer-loop)
       (when (eq (store-sync store) :interval) (spawn "beacon-fsync" #'fsync-loop))
-      (spawn "beacon-fanout" #'fanout-loop))
+      (loop for fo across (relay-fanouts relay) for i from 0
+            do (let ((fo fo))
+                 (push (sb-thread:make-thread (lambda () (fanout-loop relay fo)) :name (format nil "beacon-fanout-~d" i))
+                       (relay-threads relay)))))
     (setf (relay-server relay)
           (start-server :host (config-host config) :port (config-port config)
                         :io-threads (config-io-threads config)
@@ -574,6 +590,7 @@ crash of the MACHINE can lose up to one interval."
   (dolist (q (list (relay-verify-q relay) (relay-query-q relay))) (bqueue-close q))
   ;; let the writer and fanout drain what was already accepted
   (dolist (th (relay-threads relay)) (ignore-errors (sb-thread:join-thread th :timeout 10)))
-  (bqueue-close (relay-writer-q relay)) (bqueue-close (relay-fanout-q relay))
+  (bqueue-close (relay-writer-q relay))
+  (loop for fo across (relay-fanouts relay) do (bqueue-close (fanout-q fo)))
   (close-store (relay-store relay))
   relay)
