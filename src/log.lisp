@@ -152,13 +152,15 @@ the record starts at index 0."
 
 ;;; ---- replay ---------------------------------------------------------------------
 
+(defvar *replay-chunk* (* 4 1024 1024) "Bytes read per refill during replay.")
+
 (defun replay-log (path fn)
   "Call (FN record-octets start offset length) for every valid record of the
 log at PATH, in order.  Returns the length of the valid prefix — the caller
 truncates the file there if it is shorter than the file."
   (with-open-file (in path :element-type '(unsigned-byte 8) :direction :input :if-does-not-exist nil)
     (unless in (return-from replay-log 0))
-    (let* ((chunk (* 4 1024 1024))
+    (let* ((chunk *replay-chunk*)
            (buf (make-octets (* 2 chunk)))
            (have 0) (pos 0)     ; bytes in BUF, read cursor in BUF
            (base 0)             ; file offset of BUF[0]
@@ -170,7 +172,7 @@ truncates the file there if it is shorter than the file."
                  (decf have pos) (incf base pos) (setf pos 0)
                  (when (> need (length buf))
                    (let ((nb (make-octets (+ need chunk)))) (replace nb buf :end2 have) (setf buf nb)))
-                 (setf have (+ have (read-sequence buf in :start have))))
+                 (setf have (read-sequence buf in :start have)))   ; returns an END INDEX, not a count
                (<= (+ pos need) have)))
         (loop
           (let ((off (+ base pos)))

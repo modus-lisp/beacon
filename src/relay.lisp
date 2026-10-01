@@ -30,7 +30,7 @@
                              (max-filters 20) (max-connections 20000)
                              (events-per-second 50) (event-burst 200)
                              (reqs-per-second 50) (req-burst 200)
-                             (verify-queue 50000) (query-queue 20000)
+                             (verify-queue 4096) (query-queue 4096)
                              (name "beacon") (description "A Nostr relay in pure Common Lisp.")
                              (pubkey nil) (contact nil))))
   host port dir io-threads verify-threads query-threads sync max-message max-subscriptions
@@ -48,7 +48,9 @@
   (ingest-hist (make-array +hist-buckets+ :element-type 'sb-ext:word :initial-element 0)
    :type (simple-array sb-ext:word (*)))
   (query-hist (make-array +hist-buckets+ :element-type 'sb-ext:word :initial-element 0)
-   :type (simple-array sb-ext:word (*))))
+   :type (simple-array sb-ext:word (*)))
+  ;; where ingest time goes: queued for verify, verifying, queued for the writer, committing
+  (stage-hists (loop repeat 4 collect (make-array +hist-buckets+ :element-type 'sb-ext:word :initial-element 0))))
 
 (defun record-latency (hist t0)
   (let ((us (max 1 (- (now-us) t0))))
@@ -61,6 +63,30 @@
         (dotimes (i +hist-buckets+ (ash 1 +hist-buckets+))
           (incf acc (aref hist i))
           (when (>= acc want) (return (ash 1 (1+ i))))))))
+
+;;; ---- GC pauses ------------------------------------------------------------------------
+;;; SBCL's collector stops every thread, so a pause is latency paid by every
+;;; request in flight.  The relay reports them rather than leaving it a guess.
+
+(defvar *gc-count* 0)
+(defvar *gc-max-ms* 0)
+(defvar *gc-total-ms* 0)
+(defvar *gc-last-run-time* 0)
+(defvar *gc-pauses* (make-array 32 :element-type 'sb-ext:word :initial-element 0)
+  "Histogram of pause lengths: bucket i is [2^i, 2^(i+1)) microseconds.")
+
+(defun note-gc ()
+  (let* ((now sb-ext:*gc-run-time*)
+         (us (round (* 1000000 (- now *gc-last-run-time*)) internal-time-units-per-second)))
+    (setf *gc-last-run-time* now)
+    (incf *gc-count*)
+    (incf *gc-total-ms* (round us 1000))
+    (setf *gc-max-ms* (max *gc-max-ms* (round us 1000)))
+    (incf (aref *gc-pauses* (min 31 (integer-length (max 1 us)))))))
+
+(defun install-gc-monitor ()
+  (setf *gc-last-run-time* sb-ext:*gc-run-time*)
+  (pushnew 'note-gc sb-ext:*after-gc-hooks*))
 
 ;;; ---- the relay -------------------------------------------------------------------------
 
@@ -152,7 +178,8 @@
 
 ;;; ---- the subscription index ----------------------------------------------------------------
 
-(defun hkey (h) (ldb (byte 62 0) h))
+(declaim (inline hkey))
+(defun hkey (h) h)                      ; hashes are already fixnums
 
 (defun register-sub (relay sub)
   "Index SUB's filters for fanout.  Caller holds SUBS-LOCK."
@@ -163,9 +190,9 @@
                  (push entry (gethash key table))
                  (push (list table key entry) (sub-regs sub))))
           (cond
-            ((filter-ids f) (dolist (id (filter-ids f)) (add (relay-by-id relay) (hkey (siphash64 id)))))
+            ((filter-ids f) (dolist (id (filter-ids f)) (add (relay-by-id relay) (hkey (keyed-hash id)))))
             ((filter-tags f) (loop for h across (cdr (first (filter-tags f))) do (add (relay-by-tag relay) (hkey h))))
-            ((filter-authors f) (dolist (a (filter-authors f)) (add (relay-by-author relay) (hkey (siphash64 a)))))
+            ((filter-authors f) (dolist (a (filter-authors f)) (add (relay-by-author relay) (hkey (keyed-hash a)))))
             ((filter-kinds f)
              (dolist (k (filter-kinds f))
                (push entry (svref (relay-by-kind relay) k))
@@ -192,8 +219,8 @@
                  (when (and (/= (sub-seen sub) seq) (filter-matches-event-p (car entry) e))
                    (setf (sub-seen sub) seq)
                    (push sub out))))))
-      (try (gethash (hkey (siphash64 (event-id e))) (relay-by-id relay)))
-      (try (gethash (hkey (siphash64 (event-pubkey e))) (relay-by-author relay)))
+      (try (gethash (hkey (keyed-hash (event-id e))) (relay-by-id relay)))
+      (try (gethash (hkey (keyed-hash (event-pubkey e))) (relay-by-author relay)))
       (loop for h across (event-tag-hashes e) do (try (gethash (hkey h) (relay-by-tag relay))))
       (try (svref (relay-by-kind relay) (event-kind e)))
       (try (relay-wildcard relay)))
@@ -322,14 +349,18 @@
 (defun relay-stats-json (relay)
   (let ((st (relay-stats relay)) (store (relay-store relay)))
     (string-utf8
-     (format nil "{\"events\":~d,\"received\":~d,\"stored\":~d,\"duplicates\":~d,\"rejected\":~d,\"invalid\":~d,\"busy\":~d,\"reqs\":~d,\"counts\":~d,\"delivered\":~d,\"connections\":~d,\"verify_queue\":~d,\"query_queue\":~d,\"ingest_p50_us\":~d,\"ingest_p99_us\":~d,\"query_p50_us\":~d,\"query_p99_us\":~d,\"point_cache_hits\":~d,\"point_cache_misses\":~d}"
+     (format nil "{\"events\":~d,\"received\":~d,\"stored\":~d,\"duplicates\":~d,\"rejected\":~d,\"invalid\":~d,\"busy\":~d,\"reqs\":~d,\"counts\":~d,\"delivered\":~d,\"connections\":~d,\"verify_queue\":~d,\"query_queue\":~d,\"ingest_p50_us\":~d,\"ingest_p99_us\":~d,\"query_p50_us\":~d,\"query_p99_us\":~d,\"point_cache_hits\":~d,\"point_cache_misses\":~d,\"gc_count\":~d,\"gc_total_ms\":~d,\"gc_max_ms\":~d,\"gc_p99_ms\":~d,\"heap_mb\":~d,\"stage_p99_us\":[~{~d~^,~}],\"stage_max_us\":[~{~d~^,~}]}"
              (store-event-count store) (stats-received st) (stats-stored st) (stats-duplicates st)
              (stats-rejected st) (stats-invalid st) (stats-busy st) (stats-reqs st) (stats-counts st)
              (stats-delivered st) (server-connections (relay-server relay))
              (bqueue-count (relay-verify-q relay)) (bqueue-count (relay-query-q relay))
              (hist-percentile (stats-ingest-hist st) 0.5) (hist-percentile (stats-ingest-hist st) 0.99)
              (hist-percentile (stats-query-hist st) 0.5) (hist-percentile (stats-query-hist st) 0.99)
-             *point-cache-hits* *point-cache-misses*))))
+             *point-cache-hits* *point-cache-misses*
+             *gc-count* *gc-total-ms* *gc-max-ms* (round (hist-percentile *gc-pauses* 0.99) 1000)
+             (round (sb-kernel:dynamic-usage) 1048576)
+             (mapcar (lambda (h) (hist-percentile h 0.99)) (stats-stage-hists st))
+             (mapcar (lambda (h) (hist-percentile h 1.0)) (stats-stage-hists st))))))
 
 (defparameter +cors+ '(("Access-Control-Allow-Origin" . "*")
                        ("Access-Control-Allow-Headers" . "*")
@@ -351,9 +382,15 @@
 (defun verify-worker (relay)
   (loop while (relay-running relay) do
     (dolist (job (bqueue-pop-batch (relay-verify-q relay) :max 32 :timeout 0.5))
-      (destructuring-bind (c e t0) job
-        (if (verify-event-signature e)
-            (bqueue-push (relay-writer-q relay) job)    ; unbounded: never refuses
+      (destructuring-bind (c e t0 &rest _) job
+        (declare (ignore _))
+        (let ((t1 (now-us)) (sh (stats-stage-hists (relay-stats relay))))
+          (record-latency (first sh) t0)
+          (setf (cdr (last job)) (list t1 (now-us))))
+        (if (prog1 (verify-event-signature e)
+              (record-latency (second (stats-stage-hists (relay-stats relay))) (fourth job)))
+            (progn (setf (fifth job) (now-us))
+                   (bqueue-push (relay-writer-q relay) job))    ; unbounded: never refuses
             (progn
               (sb-ext:atomic-incf (stats-invalid (relay-stats relay)))
               (send-ok c (event-id-hex e) nil "invalid: bad signature")))))))
@@ -361,12 +398,15 @@
 (defun writer-loop (relay)
   (let ((store (relay-store relay)) (st (relay-stats relay)))
     (loop while (or (relay-running relay) (plusp (bqueue-count (relay-writer-q relay)))) do
-      (let ((jobs (bqueue-pop-batch (relay-writer-q relay) :max 4096 :timeout 0.5)))
+      (let ((jobs (bqueue-pop-batch (relay-writer-q relay) :max 4096 :timeout 0.5))
+            (tc (now-us)))
+        (dolist (j jobs) (record-latency (third (stats-stage-hists st)) (fifth j)))
         (when jobs
           (let ((results (handler-case (store-insert-batch store (mapcar #'second jobs))
                            (error (err)
                              (log-msg 0 "writer: insert failed: ~a" err)
                              (mapcar (lambda (j) (declare (ignore j)) '(:rejected . "error: could not store the event")) jobs)))))
+            (record-latency (fourth (stats-stage-hists st)) tc)
             (loop for (c e t0) in jobs
                   for (status . detail) in results
                   do (ecase status
@@ -447,6 +487,10 @@
                              :query-q (make-bqueue :limit (config-query-queue config))
                              :fanout-q (make-bqueue))))
     (setf (relay-fanned relay) (index-count (store-index store)))
+    ;; count pauses from here on, not the ones the startup replay caused
+    (setf *gc-count* 0 *gc-max-ms* 0 *gc-total-ms* 0)
+    (fill *gc-pauses* 0)
+    (install-gc-monitor)
     (flet ((spawn (name fn) (push (sb-thread:make-thread fn :arguments (list relay) :name name) (relay-threads relay))))
       (dotimes (i (config-verify-threads config)) (spawn (format nil "beacon-verify-~d" i) #'verify-worker))
       (dotimes (i (config-query-threads config)) (spawn (format nil "beacon-query-~d" i) #'query-worker))

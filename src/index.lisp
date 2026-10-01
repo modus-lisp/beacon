@@ -1,20 +1,27 @@
 ;;;; src/index.lisp — the in-memory indexes.
 ;;;;
-;;;; Two properties drive every choice in this file.
+;;;; Three properties drive every choice in this file.
 ;;;;
 ;;;; 1. ONE WRITER, MANY LOCK-FREE READERS.  Only the writer thread mutates.  An
 ;;;;    event becomes visible when the writer bumps the published COUNT, after
 ;;;;    every structure that mentions it is written; readers take COUNT first and
-;;;;    never look at a serial >= the COUNT they took.  Growth never mutates an
-;;;;    array a reader may hold: the writer copies into a bigger array and swaps
-;;;;    the reference, and the old array stays valid for whoever still has it.
+;;;;    never look at a serial >= the COUNT they took.  Nothing a reader may be
+;;;;    holding is ever mutated in a way that changes what it already showed.
 ;;;;
 ;;;; 2. NO BOXED OBJECT PER EVENT.  SBCL's collector stops every thread, and a
 ;;;;    full collection's cost scales with the number of live boxed objects.
 ;;;;    Millions of events are therefore held as columns of unboxed integers
 ;;;;    (the collector never scans their contents), and posting lists are either
-;;;;    nodes in two big unboxed arrays or, once long, one unboxed vector each.
+;;;;    nodes in shared unboxed arrays or, once long, one unboxed vector each.
 ;;;;    The boxed-object count is O(distinct long lists), not O(events).
+;;;;
+;;;; 3. NO STEP IS PROPORTIONAL TO THE SIZE OF THE STORE.  Amortized O(1) is not
+;;;;    enough for latency: a vector that doubles copies everything it holds, and
+;;;;    at five million events that one insert took most of a second (measured,
+;;;;    under load).  So big vectors are CHUNKED — appending allocates a fresh
+;;;;    64K-entry chunk and never copies data — and hash tables resize
+;;;;    INCREMENTALLY: the old and new tables coexist and each insert migrates a
+;;;;    few slots.  The largest single step anywhere is copying one chunk.
 ;;;;
 ;;;; SERIALS.  Every stored event has a serial: its position in the columns.  At
 ;;;; startup the log is replayed and serials are assigned in created_at order, so
@@ -44,33 +51,101 @@
     (replace new old)
     new))
 
+(defun grow-vector-boxed (old n)
+  (let ((new (make-array n :initial-element nil))) (replace new old) new))
+
+;;; ---- chunked vectors -------------------------------------------------------------
+;;; Element I lives in chunk I>>16 at I&#xFFFF.  Chunk 0 starts small and doubles
+;;; up to 64K entries (so the thousands of modest posting lists stay modest);
+;;; every later chunk is allocated full-size.  Growing the DIRECTORY copies only
+;;; pointers.  A reader that loaded an older directory or an older chunk 0 still
+;;; sees every element below the count it took.
+
+(defconstant +chunk-shift+ 16)
+(defconstant +chunk-size+ (ash 1 +chunk-shift+))
+(defconstant +chunk-mask+ (1- +chunk-size+))
+
+(defstruct (cvec (:constructor %make-cvec))
+  (chunks #() :type simple-vector)
+  (element-type t))
+
+(defun make-cvec (element-type &optional (initial 64))
+  (%make-cvec :chunks (vector (make-array initial :element-type element-type :initial-element 0))
+              :element-type element-type))
+
+(defun cvec-ensure (cv i)
+  "Make index I addressable (writer only)."
+  (declare (type cvec cv) (type ufix i))
+  (let* ((ci (ash i (- +chunk-shift+)))
+         (chunks (cvec-chunks cv)))
+    (cond
+      ((zerop ci)
+       (let ((c0 (svref chunks 0)))
+         (when (>= i (length c0))
+           (let ((new (grow-vector c0 (min +chunk-size+ (max (* 2 (length c0)) (1+ i))))))
+             (barrier-write)
+             (setf (svref chunks 0) new)))))
+      (t
+       ;; chunk 0 must be full-size before any later chunk exists
+       (when (< (length (svref chunks 0)) +chunk-size+)
+         (let ((new (grow-vector (svref chunks 0) +chunk-size+)))
+           (barrier-write)
+           (setf (svref chunks 0) new)))
+       (when (>= ci (length chunks))
+         (setf chunks (grow-vector-boxed chunks (max (* 2 (length chunks)) (1+ ci))))
+         (barrier-write)
+         (setf (cvec-chunks cv) chunks))
+       (unless (svref chunks ci)
+         (let ((new (make-array +chunk-size+ :element-type (cvec-element-type cv) :initial-element 0)))
+           (barrier-write)
+           (setf (svref chunks ci) new)))))
+    cv))
+
+(defmacro cvref (cv i type)
+  "Element I of chunked vector CV, whose elements are of TYPE.  A plain AREF
+form, so it is SETF-able; I is evaluated twice, so pass a variable."
+  `(aref (the (simple-array ,type (*)) (svref (cvec-chunks ,cv) (ash (the ufix ,i) (- +chunk-shift+))))
+         (logand ,i +chunk-mask+)))
+
 ;;; ---- columns ----------------------------------------------------------------
 
 (defstruct (columns (:constructor %make-columns))
-  (off nil :type (simple-array (unsigned-byte 64) (*)))      ; log offset of the record
-  (len nil :type (simple-array (unsigned-byte 32) (*)))      ; record length
-  (created nil :type (simple-array (unsigned-byte 32) (*)))
-  (kind nil :type (simple-array (unsigned-byte 16) (*)))
-  (author nil :type (simple-array (unsigned-byte 64) (*)))   ; keyed hash of the pubkey
-  (idpre nil :type (simple-array (unsigned-byte 64) (*)))    ; first 8 bytes of the id (raw)
-  (expire nil :type (simple-array (unsigned-byte 32) (*)))   ; NIP-40, 0 = never
-  (flags nil :type (simple-array (unsigned-byte 8) (*))))
+  (off (make-cvec '(unsigned-byte 64)) :type cvec)      ; log offset of the record
+  (len (make-cvec '(unsigned-byte 32)) :type cvec)      ; record length
+  (created (make-cvec '(unsigned-byte 32)) :type cvec)
+  (kind (make-cvec '(unsigned-byte 16)) :type cvec)
+  (author (make-cvec '(unsigned-byte 62)) :type cvec)   ; keyed hash of the pubkey
+  (idpre (make-cvec '(unsigned-byte 62)) :type cvec)    ; top bits of the id's first 8 bytes
+  (expire (make-cvec '(unsigned-byte 32)) :type cvec)   ; NIP-40, 0 = never
+  (flags (make-cvec '(unsigned-byte 8)) :type cvec))
 
-(defun make-columns (n)
-  (%make-columns :off (u64-vector n) :len (u32-vector n) :created (u32-vector n)
-                 :kind (make-array n :element-type '(unsigned-byte 16) :initial-element 0)
-                 :author (u64-vector n) :idpre (u64-vector n) :expire (u32-vector n)
-                 :flags (make-array n :element-type '(unsigned-byte 8) :initial-element 0)))
+(defun make-columns () (%make-columns))
 
-(defun grow-columns (c n)
-  (%make-columns :off (grow-vector (columns-off c) n) :len (grow-vector (columns-len c) n)
-                 :created (grow-vector (columns-created c) n) :kind (grow-vector (columns-kind c) n)
-                 :author (grow-vector (columns-author c) n) :idpre (grow-vector (columns-idpre c) n)
-                 :expire (grow-vector (columns-expire c) n) :flags (grow-vector (columns-flags c) n)))
+(macrolet ((def (name slot type)
+             `(progn
+                (declaim (inline ,name (setf ,name)))
+                (defun ,name (cols serial) (cvref (,slot cols) serial ,type))
+                (defun (setf ,name) (v cols serial) (setf (cvref (,slot cols) serial ,type) v)))))
+  (def col-off columns-off (unsigned-byte 64))
+  (def col-len columns-len (unsigned-byte 32))
+  (def col-created columns-created (unsigned-byte 32))
+  (def col-kind columns-kind (unsigned-byte 16))
+  (def col-author columns-author (unsigned-byte 62))
+  (def col-idpre columns-idpre (unsigned-byte 62))
+  (def col-expire columns-expire (unsigned-byte 32))
+  (def col-flags columns-flags (unsigned-byte 8)))
 
-;;; ---- open-addressing hash tables over u64 keys -----------------------------------
-;;; Key 0 means empty, so a key that hashes to 0 is stored as 1.  Values are kept
-;;; below 2^62 so reading one never conses a bignum.
+(defun columns-ensure (cols serial)
+  (dolist (cv (list (columns-off cols) (columns-len cols) (columns-created cols) (columns-kind cols)
+                    (columns-author cols) (columns-idpre cols) (columns-expire cols) (columns-flags cols)))
+    (cvec-ensure cv serial)))
+
+;;; ---- open-addressing hash tables over 62-bit keys, resized incrementally ---------------
+;;; Key 0 means empty, so a key of 0 is stored as 1.  When the live table is half
+;;; full a twice-as-large one becomes live and the old one is kept as OLD; every
+;;; later insert migrates a few of OLD's slots, and lookups consult the live
+;;; table first and OLD second.  The writer never moves a key OLD has already
+;;; shown a reader, so a reader holding either table answers correctly.
 
 (defstruct (htab (:constructor %make-htab))
   (keys nil :type (simple-array (unsigned-byte 64) (*)))
@@ -83,33 +158,42 @@
     (%make-htab :keys (u64-vector n) :vals (u64-vector n) :mask (1- n))))
 
 (defstruct (table (:constructor %make-table))
-  (ht (make-htab) :type htab))
+  (ht (make-htab) :type htab)
+  (old nil :type (or null htab))
+  (migrated 0 :type fixnum))
 
 (defun make-table (&optional (size 1024)) (%make-table :ht (make-htab size)))
 
 (declaim (inline nz-key))
-(defun nz-key (k) (declare (type (unsigned-byte 64) k)) (if (zerop k) 1 k))
+(defun nz-key (k) (declare (type (unsigned-byte 62) k)) (if (zerop k) 1 k))
 
-(defun table-get (table key)
-  "The value stored under KEY, or 0."
-  (declare (optimize (speed 3) (safety 0)) (type (unsigned-byte 64) key))
-  (let* ((ht (table-ht table))
-         (keys (htab-keys ht)) (vals (htab-vals ht)) (mask (htab-mask ht))
-         (k (nz-key key)))
-    (declare (type (simple-array (unsigned-byte 64) (*)) keys vals) (type fixnum mask)
-             (type (unsigned-byte 64) k))
+(defun htab-get (ht k)
+  "Value under K in HT, or 0."
+  (declare (optimize (speed 3) (safety 0)) (type htab ht) (type (unsigned-byte 62) k))
+  (let ((keys (htab-keys ht)) (vals (htab-vals ht)) (mask (htab-mask ht)))
+    (declare (type (simple-array (unsigned-byte 64) (*)) keys vals) (type fixnum mask))
     (loop for i of-type fixnum = (logand k mask) then (logand (1+ i) mask)
           for slot of-type (unsigned-byte 64) = (aref keys i)
           do (cond ((= slot k) (barrier-read) (return (aref vals i)))
                    ((zerop slot) (return 0))))))
 
-(defun %htab-put (ht k val)
-  (declare (optimize (speed 3) (safety 0)) (type (unsigned-byte 64) k val))
+(defun table-get (table key)
+  "The value stored under KEY, or 0."
+  (declare (type (unsigned-byte 62) key))
+  (let* ((k (nz-key key))
+         (ht (table-ht table)))
+    (barrier-read)
+    (let ((old (table-old table)))
+      (let ((v (htab-get ht k)))
+        (if (or (plusp v) (null old)) v (htab-get old k))))))
+
+(defun %htab-put (ht k val &key (overwrite t))
+  (declare (optimize (speed 3) (safety 0)) (type (unsigned-byte 62) k val))
   (let ((keys (htab-keys ht)) (vals (htab-vals ht)) (mask (htab-mask ht)))
     (declare (type (simple-array (unsigned-byte 64) (*)) keys vals) (type fixnum mask))
     (loop for i of-type fixnum = (logand k mask) then (logand (1+ i) mask)
           for slot of-type (unsigned-byte 64) = (aref keys i)
-          do (cond ((= slot k) (setf (aref vals i) val) (return nil))
+          do (cond ((= slot k) (when overwrite (setf (aref vals i) val)) (return nil))
                    ((zerop slot)
                     ;; value first, then the key that makes it findable
                     (setf (aref vals i) val)
@@ -118,50 +202,72 @@
                     (incf (htab-count ht))
                     (return t))))))
 
+(defconstant +migrate-per-put+ 16)
+
+(defun %migrate-some (table)
+  (let ((old (table-old table)))
+    (when old
+      (let* ((ht (table-ht table)) (keys (htab-keys old)) (vals (htab-vals old))
+             (start (table-migrated table))
+             (end (min (length keys) (+ start +migrate-per-put+))))
+        (loop for i from start below end
+              for k = (aref keys i)
+              unless (zerop k)
+                ;; never overwrite: a key already in the live table is newer
+                do (%htab-put ht k (aref vals i) :overwrite nil))
+        (setf (table-migrated table) end)
+        (when (= end (length keys))
+          (barrier-write)
+          (setf (table-old table) nil))))))
+
 (defun table-put (table key val)
   "Store VAL under KEY (writer only)."
-  (let ((ht (table-ht table)) (k (nz-key key)))
-    (when (> (* 2 (1+ (htab-count ht))) (length (htab-keys ht)))
-      (let ((new (make-htab (* 2 (length (htab-keys ht))))))
-        (loop for i below (length (htab-keys ht))
-              for kk = (aref (htab-keys ht) i)
-              unless (zerop kk) do (%htab-put new kk (aref (htab-vals ht) i)))
-        (barrier-write)
-        (setf (table-ht table) new ht new)))
-    (%htab-put ht k val)))
+  (let ((k (nz-key key)))
+    (%migrate-some table)
+    (let ((ht (table-ht table)))
+      (when (> (* 2 (1+ (htab-count ht))) (length (htab-keys ht)))
+        ;; finish any migration still running, then start a new one
+        (loop while (table-old table) do (%migrate-some table))
+        (let ((new (make-htab (* 2 (length (htab-keys ht))))))
+          (setf (table-migrated table) 0 (table-old table) ht)
+          (barrier-write)
+          (setf (table-ht table) new ht new)))
+      (%htab-put ht k val))))
 
-(defun table-count (table) (htab-count (table-ht table)))
+(defun table-count (table)
+  (+ (htab-count (table-ht table)) (let ((o (table-old table))) (if o (htab-count o) 0))))
 
 ;;; ---- plists: long posting lists ----------------------------------------------------
-;;; DATA holds serials in insertion order.  Per block of 64 entries, BMAX/BMIN are
-;;; the created_at bounds and PMAX is the running maximum of BMAX over blocks
-;;; 0..b — the newest event anywhere at or before block b.  A backwards scan can
-;;; stop the moment PMAX falls below what it still needs.
+;;; DATA (chunked) holds serials in insertion order.  Per block of 64 entries,
+;;; BMAX/BMIN are the created_at bounds and PMAX is the running maximum of BMAX
+;;; over blocks 0..b — the newest event anywhere at or before block b.  A
+;;; backwards scan can stop the moment PMAX falls below what it still needs.  The
+;;; block arrays are 1/64 the size of the data, so they are simply grown.
 
 (defstruct (plist (:constructor %make-plist))
-  (data (u32-vector 64) :type (simple-array (unsigned-byte 32) (*)))
+  (data (make-cvec '(unsigned-byte 32) 64) :type cvec)
   (bmax (u32-vector 1) :type (simple-array (unsigned-byte 32) (*)))
   (bmin (u32-vector 1) :type (simple-array (unsigned-byte 32) (*)))
   (pmax (u32-vector 1) :type (simple-array (unsigned-byte 32) (*)))
   (count 0 :type fixnum))
 
-(defun make-plist (&optional (capacity 64))
-  (let ((nb (ceiling capacity +blk+)))
-    (%make-plist :data (u32-vector (* nb +blk+)) :bmax (u32-vector nb) :bmin (u32-vector nb)
-                 :pmax (u32-vector nb))))
+(defun make-plist () (%make-plist))
+
+(declaim (inline plist-ref))
+(defun plist-ref (pl i) (cvref (plist-data pl) i (unsigned-byte 32)))
 
 (defun plist-append (pl serial created)
   (declare (type plist pl) (type (unsigned-byte 32) serial created))
-  (let ((c (plist-count pl)))
-    (when (>= c (length (plist-data pl)))
-      (let* ((n (* 2 (length (plist-data pl)))) (nb (ceiling n +blk+)))
+  (let* ((c (plist-count pl))
+         (b (ash c (- +blk-shift+))))
+    (cvec-ensure (plist-data pl) c)
+    (when (>= b (length (plist-bmax pl)))
+      (let ((nb (* 2 (length (plist-bmax pl)))))
         (setf (plist-bmax pl) (grow-vector (plist-bmax pl) nb)
               (plist-bmin pl) (grow-vector (plist-bmin pl) nb)
-              (plist-pmax pl) (grow-vector (plist-pmax pl) nb)
-              (plist-data pl) (grow-vector (plist-data pl) n))))
-    (let ((b (ash c (- +blk-shift+)))
-          (bmax (plist-bmax pl)) (bmin (plist-bmin pl)) (pmax (plist-pmax pl)))
-      (setf (aref (plist-data pl) c) serial)
+              (plist-pmax pl) (grow-vector (plist-pmax pl) nb))))
+    (let ((bmax (plist-bmax pl)) (bmin (plist-bmin pl)) (pmax (plist-pmax pl)))
+      (setf (cvref (plist-data pl) c (unsigned-byte 32)) serial)
       (if (zerop (logand c (1- +blk+)))
           (setf (aref bmax b) created (aref bmin b) created)
           (setf (aref bmax b) (max created (aref bmax b))
@@ -175,16 +281,13 @@
 ;;;   0                          empty
 ;;;   (count << 32) | head       a linked list of COUNT nodes, newest first
 ;;;   +PLIST-FLAG+ | index       plist number INDEX
-;;; Nodes live in two growable unboxed arrays shared by every short list.
-
-(defstruct (nodes (:constructor %make-nodes))
-  (serial (u32-vector 1024) :type (simple-array (unsigned-byte 32) (*)))
-  (next (u32-vector 1024) :type (simple-array (unsigned-byte 32) (*)))
-  (fill 1 :type fixnum))                ; node 0 is the list terminator
+;;; Nodes live in two chunked unboxed vectors shared by every short list.
 
 (defstruct (postings (:constructor %make-postings))
   (table (make-table 4096) :type table)
-  (nodes (%make-nodes) :type nodes)
+  (node-serial (make-cvec '(unsigned-byte 32) 1024) :type cvec)
+  (node-next (make-cvec '(unsigned-byte 32) 1024) :type cvec)
+  (nnodes 1 :type fixnum)                 ; node 0 is the list terminator
   (plists (make-array 64 :initial-element nil) :type simple-vector)
   (nplists 0 :type fixnum))
 
@@ -193,16 +296,17 @@
 (defun postings-plist (p handle)
   (svref (postings-plists p) (logand handle (1- +plist-flag+))))
 
+(declaim (inline node-serial node-next))
+(defun node-serial (p i) (cvref (postings-node-serial p) i (unsigned-byte 32)))
+(defun node-next (p i) (cvref (postings-node-next p) i (unsigned-byte 32)))
+
 (defun %new-node (p serial next)
-  (let* ((nd (postings-nodes p)) (i (nodes-fill nd)))
-    (when (>= i (length (nodes-serial nd)))
-      (let ((n (* 2 (length (nodes-serial nd)))))
-        (setf nd (%make-nodes :serial (grow-vector (nodes-serial nd) n)
-                              :next (grow-vector (nodes-next nd) n) :fill i))
-        (barrier-write)
-        (setf (postings-nodes p) nd)))
-    (setf (aref (nodes-serial nd) i) serial (aref (nodes-next nd) i) next)
-    (setf (nodes-fill nd) (1+ i))
+  (let ((i (postings-nnodes p)))
+    (cvec-ensure (postings-node-serial p) i)
+    (cvec-ensure (postings-node-next p) i)
+    (setf (cvref (postings-node-serial p) i (unsigned-byte 32)) serial
+          (cvref (postings-node-next p) i (unsigned-byte 32)) next)
+    (setf (postings-nnodes p) (1+ i))
     i))
 
 (defun postings-add (p key serial created-of)
@@ -218,10 +322,9 @@ plist block bounds)."
          (table-put (postings-table p) key (logior (ash (1+ (ash h -32)) 32) node))))
       (t
        ;; promote: copy the linked list (newest first) into a plist (oldest first)
-       (let* ((nd (postings-nodes p))
-              (serials (loop for i = (logand h #xffffffff) then (aref (nodes-next nd) i)
-                             until (zerop i) collect (aref (nodes-serial nd) i)))
-              (pl (make-plist 128)))
+       (let* ((serials (loop for i = (logand h #xffffffff) then (node-next p i)
+                             until (zerop i) collect (node-serial p i)))
+              (pl (make-plist)))
          (dolist (s (nreverse serials)) (plist-append pl s (funcall created-of s)))
          (plist-append pl serial (funcall created-of serial))
          (when (>= (postings-nplists p) (length (postings-plists p)))
@@ -233,28 +336,26 @@ plist block bounds)."
            (barrier-write)
            (table-put (postings-table p) key (logior +plist-flag+ idx))))))))
 
-(defun grow-vector-boxed (old n)
-  (let ((new (make-array n :initial-element nil))) (replace new old) new))
-
 ;;; ---- the index ---------------------------------------------------------------------
 
 (defstruct (index (:constructor %make-index))
   (count 0 :type fixnum)                      ; published: serials [0, count) are visible
-  (columns (make-columns 1024) :type columns)
-  (ids (make-table 4096) :type table)         ; id hash -> serial
-  (all (make-plist 1024) :type plist)         ; every serial
+  (columns (make-columns) :type columns)
+  (ids (make-table 4096) :type table)         ; id hash -> serial+1
+  (all (make-plist) :type plist)              ; every serial
   (kinds (make-array 65536 :initial-element nil) :type simple-vector)  ; kind -> plist
   (authors (make-postings) :type postings)    ; pubkey hash -> postings
   (tags (make-postings) :type postings)       ; tag key hash -> postings
   (replaceable (make-table 1024) :type table) ; replaceable key -> serial+1
-  (deleted-ids (make-table 256) :type table)  ; NIP-09: id hash -> deleter's pubkey hash
+  (deleted-ids (make-table 256) :type table)  ; NIP-09: id hash -> who deleted it
   (deleted-addrs (make-table 256) :type table) ; NIP-09 "a": replaceable key -> deletion created_at+1
   (live 0 :type fixnum))                      ; visible, not deleted
 
 (defun make-index () (%make-index))
 
 (defun index-created-of (idx)
-  (lambda (s) (aref (columns-created (index-columns idx)) s)))
+  (let ((cols (index-columns idx)))
+    (lambda (s) (col-created cols s))))
 
 (defun replaceable-key (author-hash kind dhash)
   "Keyed hash of (author, kind, d-tag): the identity of a replaceable or
@@ -263,46 +364,47 @@ addressable event slot."
     (dotimes (i 8) (setf (aref b i) (ldb (byte 8 (* 8 i)) author-hash)
                          (aref b (+ 10 i)) (ldb (byte 8 (* 8 i)) dhash)))
     (setf (aref b 8) (ldb (byte 8 0) kind) (aref b 9) (ldb (byte 8 8) kind))
-    (siphash64 b)))
+    (keyed-hash b)))
 
 (defun id-prefix (id &optional (start 0))
-  "The first 8 bytes of an id as an integer (below 2^62 is not guaranteed, so
-this is only ever compared against the column, both as u64)."
-  (let ((v 0)) (dotimes (i 8 v) (setf v (logior (ash v 8) (aref id (+ start i)))))))
+  "The top 62 bits of an id's first 8 bytes — a fixnum.  Together with the
+62-bit keyed hash that finds the slot, a false match needs ~124 bits to line up."
+  (declare (type octets id) (type ufix start))
+  (let ((v 0))
+    (declare (type (unsigned-byte 64) v))
+    (dotimes (i 8) (setf v (logior (ash v 8) (aref id (+ start i)))))
+    (ash v -2)))
 
 (defun index-find-id (idx id &optional (start 0))
   "Serial of the stored event with ID (octets at START), or NIL.  Deleted events
 are still found — the caller decides what a deleted hit means."
-  (let ((v (table-get (index-ids idx) (siphash64 id start (+ start 32)))))
+  (let ((v (table-get (index-ids idx) (keyed-hash id start (+ start 32)))))
     (unless (zerop v)
       (let ((serial (1- v)))
         (when (and (< serial (index-count idx))
-                   (= (aref (columns-idpre (index-columns idx)) serial) (id-prefix id start)))
+                   (= (col-idpre (index-columns idx) serial) (id-prefix id start)))
           serial)))))
 
 (defun index-add (idx &key off len created kind author-hash id id-start expire tag-hashes)
   "Add one event at serial COUNT and publish it.  Writer only.  Returns the serial."
   (let* ((s (index-count idx))
          (c (index-columns idx)))
-    (when (>= s (length (columns-off c)))
-      (setf c (grow-columns c (* 2 (length (columns-off c)))))
-      (barrier-write)
-      (setf (index-columns idx) c))
-    (setf (aref (columns-off c) s) off
-          (aref (columns-len c) s) len
-          (aref (columns-created c) s) created
-          (aref (columns-kind c) s) kind
-          (aref (columns-author c) s) author-hash
-          (aref (columns-idpre c) s) (id-prefix id id-start)
-          (aref (columns-expire c) s) expire
-          (aref (columns-flags c) s) 0)
+    (columns-ensure c s)
+    (setf (col-off c s) off
+          (col-len c s) len
+          (col-created c s) created
+          (col-kind c s) kind
+          (col-author c s) author-hash
+          (col-idpre c s) (id-prefix id id-start)
+          (col-expire c s) expire
+          (col-flags c s) 0)
     (let ((created-of (index-created-of idx)))
       ;; the columns must be visible before any list mentions the serial
       (barrier-write)
-      (table-put (index-ids idx) (siphash64 id id-start (+ id-start 32)) (1+ s))
+      (table-put (index-ids idx) (keyed-hash id id-start (+ id-start 32)) (1+ s))
       (plist-append (index-all idx) s created)
       (let ((kl (or (svref (index-kinds idx) kind)
-                    (setf (svref (index-kinds idx) kind) (make-plist 64)))))
+                    (setf (svref (index-kinds idx) kind) (make-plist)))))
         (plist-append kl s created))
       (postings-add (index-authors idx) author-hash s created-of)
       (loop for h across tag-hashes do (postings-add (index-tags idx) h s created-of)))
@@ -313,12 +415,12 @@ are still found — the caller decides what a deleted hit means."
 
 (defun index-delete (idx serial)
   "Mark SERIAL deleted (writer only).  Lists keep the entry; readers skip it."
-  (let ((flags (columns-flags (index-columns idx))))
-    (unless (logtest (aref flags serial) +flag-deleted+)
-      (setf (aref flags serial) (logior (aref flags serial) +flag-deleted+))
+  (let ((cols (index-columns idx)))
+    (unless (logtest (col-flags cols serial) +flag-deleted+)
+      (setf (col-flags cols serial) (logior (col-flags cols serial) +flag-deleted+))
       (decf (index-live idx))
       t)))
 
 (declaim (inline serial-deleted-p))
 (defun serial-deleted-p (cols serial)
-  (logtest (aref (columns-flags cols) serial) +flag-deleted+))
+  (logtest (col-flags cols serial) +flag-deleted+))

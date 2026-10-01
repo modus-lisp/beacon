@@ -43,7 +43,7 @@
 
 (defun pubkey-point (pubkey)
   "The even-Y curve point for x-only PUBKEY (32 octets), or NIL if none exists."
-  (let* ((h (siphash64 pubkey))
+  (let* ((h (keyed-hash pubkey))
          (shard (svref *point-cache* (logand h (1- +point-shards+))))
          (key (ldb (byte 62 0) h)))
     (let ((hit (sb-thread:with-mutex ((point-shard-lock shard))

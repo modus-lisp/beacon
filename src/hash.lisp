@@ -210,44 +210,58 @@
 (defvar *sip-k0* #x0706050403020100)
 (defvar *sip-k1* #x0f0e0d0c0b0a0908)
 
-(defun siphash64 (data &optional (start 0) (end (length data)) (prefix-byte nil)
-                       (k0 *sip-k0*) (k1 *sip-k1*))
-  "SipHash-2-4 of [PREFIX-BYTE] || DATA[START,END) under key (K0 K1).
-PREFIX-BYTE lets a tag hash fold in the tag letter without copying the value."
-  (declare (optimize (speed 3) (safety 0))
-           (type octets data) (type ufix start end) (type u64 k0 k1))
-  (let* ((v0 (logxor k0 #x736f6d6570736575))
-         (v1 (logxor k1 #x646f72616e646f6d))
-         (v2 (logxor k0 #x6c7967656e657261))
-         (v3 (logxor k1 #x7465646279746573))
-         (len (+ (- end start) (if prefix-byte 1 0)))
-         (pos 0))
-    (declare (type u64 v0 v1 v2 v3) (type ufix len pos))
-    (flet ((byte-at (i)
-             (declare (type ufix i))
-             (if prefix-byte
-                 (if (zerop i) (the (unsigned-byte 8) prefix-byte) (aref data (+ start i -1)))
-                 (aref data (+ start i)))))
-      (declare (inline byte-at))
-      (loop while (<= (+ pos 8) len) do
-        (let ((m 0))
-          (declare (type u64 m))
-          (dotimes (i 8) (setf m (logior m (ash (byte-at (+ pos i)) (* 8 i)))))
-          (setf v3 (logxor v3 m))
-          (%sipround v0 v1 v2 v3) (%sipround v0 v1 v2 v3)
-          (setf v0 (logxor v0 m))
-          (incf pos 8)))
-      (let ((m (ash (ldb (byte 8 0) len) 56)))
-        (declare (type u64 m))
-        (loop for i from 0 below (- len pos)
-              do (setf m (logior m (ash (byte-at (+ pos i)) (* 8 i)))))
-        (setf v3 (logxor v3 m))
-        (%sipround v0 v1 v2 v3) (%sipround v0 v1 v2 v3)
-        (setf v0 (logxor v0 m))))
-    (setf v2 (logxor v2 #xff))
-    (%sipround v0 v1 v2 v3) (%sipround v0 v1 v2 v3)
-    (%sipround v0 v1 v2 v3) (%sipround v0 v1 v2 v3)
-    (logxor v0 v1 v2 v3)))
+(defmacro define-siphash (name doc result-form)
+  `(defun ,name (data &optional (start 0) (end (length data)) (prefix-byte nil)
+                      (k0 *sip-k0*) (k1 *sip-k1*))
+     ,doc
+     (declare (optimize (speed 3) (safety 0))
+              (type octets data) (type ufix start end) (type u64 k0 k1))
+     (let* ((v0 (logxor k0 #x736f6d6570736575))
+            (v1 (logxor k1 #x646f72616e646f6d))
+            (v2 (logxor k0 #x6c7967656e657261))
+            (v3 (logxor k1 #x7465646279746573))
+            (len (+ (- end start) (if prefix-byte 1 0)))
+            (pos 0))
+       (declare (type u64 v0 v1 v2 v3) (type ufix len pos))
+       (flet ((byte-at (i)
+                (declare (type ufix i))
+                (if prefix-byte
+                    (if (zerop i) (the (unsigned-byte 8) prefix-byte) (aref data (+ start i -1)))
+                    (aref data (+ start i)))))
+         (declare (inline byte-at))
+         (loop while (<= (+ pos 8) len) do
+           (let ((m 0))
+             (declare (type u64 m))
+             (dotimes (i 8) (setf m (logior m (ash (byte-at (+ pos i)) (* 8 i)))))
+             (setf v3 (logxor v3 m))
+             (%sipround v0 v1 v2 v3) (%sipround v0 v1 v2 v3)
+             (setf v0 (logxor v0 m))
+             (incf pos 8)))
+         (let ((m (ash (ldb (byte 8 0) len) 56)))
+           (declare (type u64 m))
+           (loop for i from 0 below (- len pos)
+                 do (setf m (logior m (ash (byte-at (+ pos i)) (* 8 i)))))
+           (setf v3 (logxor v3 m))
+           (%sipround v0 v1 v2 v3) (%sipround v0 v1 v2 v3)
+           (setf v0 (logxor v0 m))))
+       (setf v2 (logxor v2 #xff))
+       (%sipround v0 v1 v2 v3) (%sipround v0 v1 v2 v3)
+       (%sipround v0 v1 v2 v3) (%sipround v0 v1 v2 v3)
+       ,result-form)))
+
+(define-siphash siphash64
+  "SipHash-2-4 of [PREFIX-BYTE] || DATA[START,END) under key (K0 K1) — the full
+64-bit value, as in the reference.  Returns a bignum on SBCL when the top bits
+are set, so the relay itself uses KEYED-HASH."
+  (logxor v0 v1 v2 v3))
+
+(define-siphash keyed-hash
+  "SipHash-2-4 truncated to 62 bits: always a FIXNUM, so the hot paths that pass
+hashes around (index keys, posting lists, the subscription index) never box a
+bignum.  PREFIX-BYTE lets a tag hash fold in the tag letter without copying."
+  (ldb (byte 62 0) (logxor v0 v1 v2 v3)))
+
+(deftype hash62 () '(unsigned-byte 62))
 
 (defun set-hash-key (key16)
   "Install the store's 16-byte secret as the SipHash key."
@@ -264,10 +278,38 @@ PREFIX-BYTE lets a tag hash fold in the tag letter without copying the value."
         (dotimes (k 8) (setf c (if (logbitp 0 c) (logxor #xEDB88320 (ash c -1)) (ash c -1))))
         (setf (aref tab n) c)))))
 
+;;; Slicing-by-8: eight bytes per step through eight derived tables.  Every
+;;; record is checksummed on write and again on every replay, so this is on the
+;;; writer's path and on the startup path.
+(declaim (type (simple-array u32 (2048)) +crc-tables+))
+(defparameter +crc-tables+
+  (let ((tab (make-array 2048 :element-type 'u32)))
+    (replace tab +crc-table+)
+    (loop for k from 1 below 8 do
+      (dotimes (n 256)
+        (let ((prev (aref tab (+ (* 256 (1- k)) n))))
+          (setf (aref tab (+ (* 256 k) n))
+                (logxor (ash prev -8) (aref +crc-table+ (logand prev #xff)))))))
+    tab))
+
 (defun crc32 (data &optional (start 0) (end (length data)))
   (declare (optimize (speed 3) (safety 0)) (type octets data) (type ufix start end))
-  (let ((c #xffffffff) (tab +crc-table+))
-    (declare (type u32 c))
-    (loop for i of-type ufix from start below end
-          do (setf c (logxor (aref tab (logand (logxor c (aref data i)) #xff)) (ash c -8))))
+  (let ((c #xffffffff) (tab +crc-tables+) (i start))
+    (declare (type u32 c) (type ufix i))
+    (loop while (<= (+ i 8) end) do
+      (let ((x (logxor c (logior (aref data i) (ash (aref data (+ i 1)) 8)
+                                 (ash (aref data (+ i 2)) 16) (ash (aref data (+ i 3)) 24)))))
+        (declare (type u32 x))
+        (setf c (logxor (aref tab (+ 1792 (logand x #xff)))
+                        (aref tab (+ 1536 (logand (ash x -8) #xff)))
+                        (aref tab (+ 1280 (logand (ash x -16) #xff)))
+                        (aref tab (+ 1024 (ash x -24)))
+                        (aref tab (+ 768 (aref data (+ i 4))))
+                        (aref tab (+ 512 (aref data (+ i 5))))
+                        (aref tab (+ 256 (aref data (+ i 6))))
+                        (aref tab (aref data (+ i 7)))))
+        (incf i 8)))
+    (loop while (< i end)
+          do (setf c (logxor (aref tab (logand (logxor c (aref data i)) #xff)) (ash c -8)))
+             (incf i))
     (logxor c #xffffffff)))

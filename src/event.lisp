@@ -91,7 +91,7 @@
 ;;; A key is SipHash(letter || utf8(value)) under the store's secret key.
 
 (defun tag-key-hash (letter-code value-octets &optional (start 0) (end (length value-octets)))
-  (siphash64 value-octets start end letter-code))
+  (keyed-hash value-octets start end letter-code))
 
 (defun single-letter-tag-p (name)
   (and (= (length name) 1)

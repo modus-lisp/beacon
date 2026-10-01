@@ -103,6 +103,42 @@ FAKE-SIG skips signing (for store tests, which do not verify)."
          (handler-case (progn (json-parse-string (make-string 200 :initial-element #\[)) nil)
            (json-error () t))))
 
+;;; ---- index structures across chunk and resize boundaries ---------------------------
+
+(defun test-index-structures ()
+  ;; chunked vector: past several 64K chunks, and chunk 0's doubling
+  (let ((cv (beacon::make-cvec '(unsigned-byte 32) 4)) (n 300000))
+    (dotimes (i n) (beacon::cvec-ensure cv i) (setf (beacon::cvref cv i (unsigned-byte 32)) (* 7 i)))
+    (check "cvec holds 300k values across chunks"
+           (loop for i below n always (= (beacon::cvref cv i (unsigned-byte 32)) (* 7 i)))))
+  ;; incremental-resize table: every key findable at every point, overwrites win
+  (let ((tb (beacon::make-table 16)) (n 500000) (bad 0) (checked-mid nil))
+    (dotimes (i n)
+      (beacon::table-put tb (+ 1000 (* 3 i)) (1+ i))
+      ;; while a migration is in progress, look up a spread of earlier keys
+      (when (and (beacon::table-old tb) (zerop (mod i 997)))
+        (setf checked-mid t)
+        (loop for j from 0 to i by (max 1 (floor i 50))
+              unless (= (beacon::table-get tb (+ 1000 (* 3 j))) (1+ j)) do (incf bad))))
+    (check "table: lookups correct DURING migrations" (and checked-mid (zerop bad)))
+    (check "table: all 500k keys after growth"
+           (loop for i below n always (= (beacon::table-get tb (+ 1000 (* 3 i))) (1+ i))))
+    (check "table: absent keys absent" (loop for i below 1000 always (zerop (beacon::table-get tb (+ 1001 (* 3 i))))))
+    ;; overwrite keys that may still sit only in the OLD table
+    (let ((tb (beacon::make-table 16)) (ok t))
+      (dotimes (i 70000)
+        (beacon::table-put tb i 5)
+        (when (beacon::table-old tb) (beacon::table-put tb (floor i 2) 9)))
+      (dotimes (i 70000)
+        (let ((v (beacon::table-get tb i)))
+          (unless (member v '(5 9)) (setf ok nil))))
+      (check "table: overwrite during migration never resurrects nothing" ok)
+      (let ((tb (beacon::make-table 16)))
+        (dotimes (i 40000) (beacon::table-put tb i 1))
+        (dotimes (i 40000) (beacon::table-put tb i 2))   ; overwrite everything, migrations included
+        (dotimes (i 1000) (beacon::table-put tb (+ 100000 i) 3))
+        (check "table: overwrite always wins" (loop for i below 40000 always (= 2 (beacon::table-get tb i))))))))
+
 ;;; ---- event parsing ------------------------------------------------------------------
 
 (defun test-events ()
@@ -299,17 +335,48 @@ FAKE-SIG skips signing (for store tests, which do not verify)."
       (close-store store))
     (check (format nil "store agrees with the model (~d mismatches)" mismatches) (zerop mismatches))))
 
+(defun test-big-replay ()
+  "Replay with a 4 KB read chunk: hundreds of refills, records straddling every
+boundary, and records (10 KB, 200 KB) larger than a chunk."
+  (let* ((dir (fresh-dir "big-replay"))
+         (store (open-store dir :sync nil))
+         (k (make-test-key 77)) (now (unix-now)) (n 0))
+    (loop for batch below 12
+          do (incf n (count :stored (insert-json store (loop for i below 100
+                                                             collect (sign-event-json k 1 (make-string (+ 9000 (random 3000)) :initial-element #\x)
+                                                                                      :created-at (- now (random 100000)) :fake-sig t)))
+                            :key #'car)))
+    (insert-json store (list (sign-event-json k 1 (make-string 200000 :initial-element #\y) :created-at now :fake-sig t)))
+    (incf n)
+    (close-store store)
+    (let ((store (let ((beacon::*replay-chunk* 4096)) (open-store dir :sync nil))))
+      (check (format nil "big replay: ~d events back" n) (= n (store-event-count store)))
+      (check "big replay: the huge record reads back"
+             (= 1 (length (q store "{\"kinds\":[1],\"limit\":1}"))))
+      (close-store store))))
+
 (defun run-store-tests ()
+  (test-big-replay)
   (test-store-semantics)
   (test-store-model))
 
 ;;; ---- entry ------------------------------------------------------------------------------
 
+(defun run-section (name fn)
+  "A section that dies is a failure, not the end of the run."
+  (handler-case (funcall fn)
+    (error (c) (incf *fail*) (format t "~&FAIL: section ~a died: ~a~%" name c))))
+
 (defun run (&key (network t))
   (setf *pass* 0 *fail* 0)
-  (test-primitives)
-  (test-events)
-  (run-store-tests)
-  (when (and network (fboundp 'run-network-tests)) (funcall 'run-network-tests))
+  (run-section "primitives" #'test-primitives)
+  (run-section "events" #'test-events)
+  (run-section "big replay" #'test-big-replay)
+  (run-section "store semantics" #'test-store-semantics)
+  (run-section "index structures" #'test-index-structures)
+  (run-section "store model" #'test-store-model)
+  (run-section "store model, 100k events (crosses chunk + resize boundaries)"
+               (lambda () (test-store-model :n 100000 :queries 120)))
+  (when (and network (fboundp 'run-network-tests)) (run-section "network" 'run-network-tests))
   (format t "~&~d passed, ~d failed~%" *pass* *fail*)
   (zerop *fail*))

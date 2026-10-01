@@ -20,6 +20,7 @@
   (write-lock (sb-thread:make-mutex :name "store-writer"))
   (readers (make-hash-table :test 'eq :weakness :key :synchronized t))
   (sync t)                        ; fsync each batch
+  (wbuf (make-obuf 65536))        ; the writer's encode buffer, reused across batches
   (key nil))                      ; the 16-byte SipHash secret
 
 (defun store-log-path (dir) (merge-pathnames "events.log" dir))
@@ -37,7 +38,7 @@
   "Returns (values octets start end) — the stored JSON of SERIAL, in a buffer
 that the next read on READER will overwrite."
   (let* ((cols (index-columns (store-index store)))
-         (buf (read-record reader (aref (columns-off cols) serial) (aref (columns-len cols) serial)))
+         (buf (read-record reader (col-off cols serial) (col-len cols serial)))
          (start (rec-json-start buf 0)))
     (values buf start (+ start (rec-json-length buf 0)))))
 
@@ -97,10 +98,10 @@ address-list) where each address is (kind . rkey-without-author)."
   "Apply a kind-5 event's effects to the index (writer only)."
   (let* ((idx (store-index store)) (cols (index-columns idx)))
     (dolist (id ids)
-      (table-put (index-deleted-ids idx) (siphash64 id) (deleter-code author-hash))
+      (table-put (index-deleted-ids idx) (keyed-hash id) (deleter-code author-hash))
       (let ((s (index-find-id idx id)))
-        (when (and s (= (aref (columns-author cols) s) author-hash)
-                   (/= (aref (columns-kind cols) s) 5))
+        (when (and s (= (col-author cols s) author-hash)
+                   (/= (col-kind cols s) 5))
           (index-delete idx s))))
     (loop for (kind . dhash) in addrs
           for rkey = (replaceable-key author-hash kind dhash)
@@ -108,7 +109,7 @@ address-list) where each address is (kind . rkey-without-author)."
                (when (> (1+ created) prior)
                  (table-put (index-deleted-addrs idx) rkey (1+ created))))
              (let ((v (table-get (index-replaceable idx) rkey)))
-               (when (and (plusp v) (<= (aref (columns-created cols) (1- v)) created))
+               (when (and (plusp v) (<= (col-created cols (1- v)) created))
                  (index-delete idx (1- v)))))))
 
 ;;; ---- replaceable slots ---------------------------------------------------------------
@@ -126,8 +127,8 @@ the slot's previous holder is newer; delete the other."
     (if (zerop v)
         (table-put (index-replaceable idx) rkey (1+ serial))
         (let ((old (1- v)))
-          (if (newer-p (aref (columns-created cols) serial) (aref (columns-idpre cols) serial)
-                       (aref (columns-created cols) old) (aref (columns-idpre cols) old))
+          (if (newer-p (col-created cols serial) (col-idpre cols serial)
+                       (col-created cols old) (col-idpre cols old))
               (progn (index-delete idx old)
                      (table-put (index-replaceable idx) rkey (1+ serial)))
               (index-delete idx serial))))))
@@ -169,7 +170,7 @@ from its log."
                         (setf (aref off n) file-off (aref len n) rec-len
                               (aref created n) (rec-created-at buf o) (aref kind n) (rec-kind buf o)
                               (aref expire n) (rec-expiration buf o) (aref dhash n) (rec-dhash buf o)
-                              (aref authors n) (siphash64 buf (+ o 56) (+ o 88)))
+                              (aref authors n) (keyed-hash buf (+ o 56) (+ o 88)))
                         (replace ids buf :start1 (* 32 n) :start2 (+ o 24) :end2 (+ o 56))
                         (let ((k (rec-ntags buf o)))
                           (when (> (+ ntags k) (length tags))
@@ -190,7 +191,6 @@ from its log."
                                       (and (= (aref created a) (aref created b))
                                            (< (aref off a) (aref off b)))))))
         (let ((idx (store-index store)) (kind5 '()))
-          (setf (index-columns idx) (make-columns (max 1024 n)))
           (loop for i across order
                 for ts = (subseq tags (aref tagstart i) (aref tagstart (1+ i)))
                 for s = (index-add idx :off (aref off i) :len (aref len i) :created (aref created i)
@@ -210,10 +210,10 @@ from its log."
               (let* ((obj (json-parse buf start end))
                      (pk (hex-decode (json-get obj "pubkey") 32)))
                 (multiple-value-bind (dids daddrs) (deletion-targets pk (json-get obj "tags"))
-                  (apply-deletion store (aref (columns-author (index-columns idx)) s)
-                                  (aref (columns-created (index-columns idx)) s) dids daddrs)))))
+                  (apply-deletion store (col-author (index-columns idx) s)
+                                  (col-created (index-columns idx) s) dids daddrs)))))
           (dolist (id tombstones)
-            (table-put (index-deleted-ids idx) (siphash64 id) +deleted-by-operator+)
+            (table-put (index-deleted-ids idx) (keyed-hash id) +deleted-by-operator+)
             (let ((s (index-find-id idx id))) (when s (index-delete idx s))))
           (log-msg 1 "store ~a: ~:d events (~:d live) loaded in ~,2f s"
                    (namestring dir) n (index-live idx) (/ (- (now-us) t0) 1e6)))))
@@ -240,10 +240,10 @@ Returns a list parallel to EVENTS of (STATUS . DETAIL):
            (accepted '())                          ; (position event author-hash rkey del-ids del-addrs)
            (batch-ids (make-hash-table :test 'eql))
            (batch-deleted (make-hash-table :test 'eql))   ; id hash -> author hash
-           (buf (make-obuf 4096)))
+           (buf (obuf-reset (store-wbuf store))))
       (loop for e in events for pos from 0 do
-        (let* ((id-hash (siphash64 (event-id e)))
-               (author (siphash64 (event-pubkey e)))
+        (let* ((id-hash (keyed-hash (event-id e)))
+               (author (keyed-hash (event-pubkey e)))
                (kind (event-kind e))
                (rkey (cond ((replaceable-kind-p kind) (replaceable-key author kind 0))
                            ((addressable-kind-p kind) (replaceable-key author kind (d-tag-hash e)))))
@@ -270,14 +270,14 @@ Returns a list parallel to EVENTS of (STATUS . DETAIL):
                         (let ((v (table-get (index-replaceable idx) rkey)) (cols (index-columns idx)))
                           (and (plusp v) (not (serial-deleted-p cols (1- v)))
                                (not (newer-p (event-created-at e) (id-prefix (event-id e))
-                                             (aref (columns-created cols) (1- v))
-                                             (aref (columns-idpre cols) (1- v)))))))
+                                             (col-created cols (1- v))
+                                             (col-idpre cols (1- v)))))))
                    '(:rejected . "duplicate: have a newer version of this event"))
                   (t
                    (setf (gethash id-hash batch-ids) t)
                    (multiple-value-bind (dids daddrs)
                        (if (= kind 5) (deletion-targets (event-pubkey e) (event-tags e)) (values nil nil))
-                     (dolist (d dids) (setf (gethash (siphash64 d) batch-deleted) (deleter-code author)))
+                     (dolist (d dids) (setf (gethash (keyed-hash d) batch-deleted) (deleter-code author)))
                      (let ((start (obuf-fill buf)))
                        (encode-event-record buf e)
                        (push (list pos e author rkey dids daddrs start (- (obuf-fill buf) start)) accepted)))
@@ -296,6 +296,8 @@ Returns a list parallel to EVENTS of (STATUS . DETAIL):
               (when (= (event-kind e) 5)
                 (apply-deletion store author (event-created-at e) dids daddrs))
               (setf (svref results pos) (cons :stored s))))))
+      ;; don't keep a huge buffer around after one huge batch
+      (when (> (length (obuf-data buf)) (* 64 1024 1024)) (setf (store-wbuf store) (make-obuf 65536)))
       (coerce results 'list))))
 
 (defun store-insert (store event)
@@ -309,7 +311,7 @@ Returns a list parallel to EVENTS of (STATUS . DETAIL):
       (dolist (id ids) (encode-tombstone-record buf id))
       (log-append (store-log store) buf :sync (store-sync store))
       (dolist (id ids)
-        (table-put (index-deleted-ids idx) (siphash64 id) +deleted-by-operator+)
+        (table-put (index-deleted-ids idx) (keyed-hash id) +deleted-by-operator+)
         (let ((s (index-find-id idx id))) (when s (index-delete idx s)))))))
 
 ;;; ---- compaction ---------------------------------------------------------------------------
@@ -335,9 +337,9 @@ deletion events are kept so their effect survives."
       (let ((reader (store-reader store)))
         (dotimes (s (index-count idx))
           (unless (or (serial-deleted-p cols s)
-                      (let ((x (aref (columns-expire cols) s))) (and (plusp x) (<= x now))))
-            (let ((rec (read-record reader (aref (columns-off cols) s) (aref (columns-len cols) s))))
-              (write-sequence rec out :end (aref (columns-len cols) s))
+                      (let ((x (col-expire cols s))) (and (plusp x) (<= x now))))
+            (let ((rec (read-record reader (col-off cols s) (col-len cols s))))
+              (write-sequence rec out :end (col-len cols s))
               (incf kept)))))
       (finish-output out)
       (sb-posix:fsync (fd-of out)))

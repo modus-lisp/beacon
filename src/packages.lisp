@@ -13,5 +13,5 @@
    ;; events
    #:parse-event-json #:event-id-hex #:event-json
    ;; hashing (exported for tests and tools)
-   #:sha256 #:sha1 #:base64-encode #:siphash64 #:crc32
+   #:sha256 #:sha1 #:base64-encode #:siphash64 #:keyed-hash #:crc32
    #:hex-encode #:hex-decode))
