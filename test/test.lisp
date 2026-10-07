@@ -90,7 +90,7 @@ FAKE-SIG skips signing (for store tests, which do not verify)."
   ;; JSON
   (check "json basic" (equalp (json-parse-string "{\"a\":[1,-2,\"x\\u00e9\\ud83d\\ude00\",true,null]}")
                               (list (cons "a" (vector 1 -2 (format nil "x~a~a" (code-char #xe9) (code-char #x1f600)) :true :null)))))
-  (dolist (bad '("{" "[1,]" "{\"a\" 1}" "\"\\ud800\"" "[1] x" "\"a" "01x" "{\"a\":tru}"))
+  (dolist (bad '("{" "[1,]" "{\"a\" 1}" "\"\\ud800\"" "\"\\udc00\"" "[1] x" "\"a" "01x" "{\"a\":tru}"))
     (check (format nil "json rejects ~s" bad)
            (handler-case (progn (json-parse-string bad) nil) (json-error () t))))
   (check "json rejects raw control char"

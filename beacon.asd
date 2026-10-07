@@ -8,6 +8,7 @@
   :author "ynniv"
   :license "MIT"
   :depends-on ("secp256k1-fast"      ; BIP340 Schnorr (the curve multiply)
+               "json-simple"         ; the JSON reader
                "sb-bsd-sockets"      ; listening socket (SBCL contrib)
                "sb-posix")           ; fsync, pipe (SBCL contrib)
   :serial t
@@ -18,7 +19,7 @@
     ((:file "packages")
      (:file "util")       ; octet buffers, hex, utf-8, time, logging
      (:file "hash")       ; SHA-256 (midstate), SHA-1, base64, SipHash-2-4, CRC32
-     (:file "json")       ; byte-level JSON reader + NIP-01 writer
+     (:file "json")       ; JSON reader (json-simple) + NIP-01 writer
      (:file "event")      ; parse / validate / canonical id / stored form
      (:file "verify")     ; BIP340 verify with a decoded-pubkey cache
      (:file "filter")     ; NIP-01 filters: parse, match
@@ -34,6 +35,6 @@
   :in-order-to ((test-op (test-op "beacon/test"))))
 
 (defsystem "beacon/test"
-  :depends-on ("beacon" "cl-nostr")   ; cl-nostr: an independent client to test against
+  :depends-on ("beacon" "cl-nostr" "json-simple")   ; cl-nostr: an independent client to test against
   :components ((:module "test" :serial t :components ((:file "test") (:file "network"))))
   :perform (test-op (o c) (uiop:symbol-call '#:beacon.test '#:run)))

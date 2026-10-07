@@ -50,7 +50,7 @@
     (let ((th (sb-thread:make-thread (lambda () (setf reply (ignore-errors (seal.websocket:receive-text ws)))))))
       (wait-until (lambda () reply) :timeout timeout)
       (unless reply (ignore-errors (sb-thread:terminate-thread th))))
-    (and reply (com.inuoe.jzon:parse reply))))
+    (and reply (json-simple:parse reply))))
 
 (defun http-get (path &key accept)
   (let ((s (make-instance 'sb-bsd-sockets:inet-socket :type :stream :protocol :tcp)))

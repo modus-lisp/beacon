@@ -6,7 +6,7 @@ with millions of stored events**, and measured doing it (below).
 
 Siblings: [cl-nostr](../cl-nostr) is the client (and this relay's independent
 test oracle); [secp256k1-fast](../secp256k1-fast) supplies the BIP340 curve
-arithmetic.
+arithmetic; [json-simple](../json-simple) is the JSON reader.
 
 ## ⚠️ Status
 
