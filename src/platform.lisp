@@ -111,11 +111,13 @@ when nothing is available, or :ERROR."
   (let ((words (pollset-words ps)))
     (multiple-value-bind (n errno)
         (sb-sys:with-pinned-objects (words)
-          (sb-unix:unix-poll (sb-alien:sap-alien (sb-sys:vector-sap words)
-                                                 (* (sb-alien:struct sb-unix:pollfd)))
-                             (pollset-n ps) timeout-ms))
+          (sb-alien:alien-funcall
+           (sb-alien:extern-alien "poll"
+                                  (function sb-alien:int sb-alien:system-area-pointer
+                                            sb-alien:unsigned-long sb-alien:int))
+           (sb-sys:vector-sap words) (pollset-n ps) timeout-ms))
       (declare (ignore errno))
-      (or n 0))))
+      (if (and n (> n 0)) n 0))))
 
 ;;; ---- a wakeup pipe ---------------------------------------------------------------
 ;;; Other threads hand an I/O thread work (bytes to send, a new connection) and
