@@ -31,6 +31,14 @@
     (setf (sb-bsd-sockets:non-blocking-mode s) t)
     s))
 
+(defun make-udp-socket (host port)
+  "A non-blocking UDP socket bound to HOST:PORT (port 0 = ephemeral).  The relay
+only ever READS from it: one datagram per FD-READ, and nothing is sent back."
+  (let ((s (make-instance 'sb-bsd-sockets:inet-socket :type :datagram :protocol :udp)))
+    (sb-bsd-sockets:socket-bind s (parse-ipv4 host) port)
+    (setf (sb-bsd-sockets:non-blocking-mode s) t)
+    s))
+
 (defun listener-port (s) (nth-value 1 (sb-bsd-sockets:socket-name s)))
 (defun socket-fd (s) (sb-bsd-sockets:socket-file-descriptor s))
 

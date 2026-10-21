@@ -43,10 +43,20 @@
                              (verify-queue 4096) (query-queue 4096)
                              (name "beacon") (description "A Nostr relay in pure Common Lisp.")
                              (pubkey nil) (contact nil)
-                             (event-policy nil) (retain-ephemeral nil) (ephemeral-ttl 600))))
+                             (event-policy nil) (retain-ephemeral nil) (ephemeral-ttl 600)
+                             (udp-port nil) (udp-max-datagram 1472) (udp-secret nil))))
   host port dir io-threads verify-threads query-threads fanout-threads sync fsync-interval-ms max-message max-subscriptions
   max-filters max-connections events-per-second event-burst reqs-per-second req-burst
   verify-queue query-queue name description pubkey contact
+  ;; UDP-PORT: NIL, or a port to ingest signed events from as single datagrams (on
+  ;; HOST, same as the WebSocket listener).  The events share EVENTS-PER-SECOND and
+  ;; EVENT-BURST, through a bucket of their own.  UDP-MAX-DATAGRAM: larger datagrams
+  ;; are dropped unread, since they would have been fragmented on the way.
+  udp-port udp-max-datagram
+  ;; UDP-SECRET: NIL, or the relay's secret key as 64 hex digits.  With it set, a UDP
+  ;; datagram may instead be NIP-44 v2 encrypted to the relay's public key (logged at
+  ;; startup), so a passive observer cannot read the event.  Plaintext still works.
+  udp-secret
   ;; EVENT-POLICY: NIL, or a function of a parsed (not yet verified) EVENT, called on
   ;; an I/O thread.  It returns NIL to accept, :DROP or (:DROP "reason") to refuse
   ;; with OK false "blocked: reason", or a positive number of seconds to accept now
@@ -66,6 +76,7 @@
   (received 0 :type sb-ext:word) (stored 0 :type sb-ext:word) (duplicates 0 :type sb-ext:word)
   (rejected 0 :type sb-ext:word) (invalid 0 :type sb-ext:word) (busy 0 :type sb-ext:word)
   (reqs 0 :type sb-ext:word) (counts 0 :type sb-ext:word) (delivered 0 :type sb-ext:word)
+  (udp 0 :type sb-ext:word)                ; datagrams read from the UDP port
   (ingest-hist (make-array +hist-buckets+ :element-type 'sb-ext:word :initial-element 0)
    :type (simple-array sb-ext:word (*)))
   (query-hist (make-array +hist-buckets+ :element-type 'sb-ext:word :initial-element 0)
@@ -119,7 +130,10 @@
   (retained '())                          ; (arrival-us . event), newest first
   (retained-lock (sb-thread:make-mutex :name "retained"))
   (running t)
-  (fanouts #() :type simple-vector))      ; the fanout shards
+  (fanouts #() :type simple-vector)       ; the fanout shards
+  (udp nil)                               ; the UDP ingest socket, when UDP-PORT is set
+  (udp-limit nil)                         ; its token bucket (a CSTATE), made with it
+  (udp-key nil))                          ; the relay's secret scalar, when UDP-SECRET is set
 
 ;;; A FANOUT shard owns the live subscriptions of the connections assigned to
 ;;; it (by connection id) and sees EVERY stored event, in serial order.  Each
@@ -298,28 +312,92 @@ and let the fanout thread take it out of the index."
                    (sb-ext:atomic-incf (stats-invalid st))
                    (return-from handle-event-msg
                      (send-ok c raw-id nil (format nil "invalid: ~a" (invalid-event-reason err))))))))
-        ;; cheap early answer for the commonest case: we already have it
-        (let* ((idx (store-index (relay-store relay))) (s (index-find-id idx (event-id e))))
-          (when (and s (not (serial-deleted-p (index-columns idx) s)))
-            (sb-ext:atomic-incf (stats-duplicates st))
-            (return-from handle-event-msg (send-ok c raw-id t "duplicate: already have this event"))))
-        (let* ((policy (config-event-policy (relay-config relay)))
-               (verdict (and policy (handler-case (funcall policy e)
-                                      (error (err) (log-msg 0 "event policy: ~a" err) nil)))))
-          (cond ((null verdict))
-                ((or (eq verdict :drop) (and (consp verdict) (eq (car verdict) :drop)))
-                 (sb-ext:atomic-incf (stats-rejected st))
-                 (return-from handle-event-msg
-                   (send-ok c raw-id nil (format nil "blocked: ~a" (if (consp verdict) (second verdict) "policy")))))
-                ((and (realp verdict) (plusp verdict))
-                 (let ((q (relay-verify-q relay)))
-                   (sb-ext:schedule-timer (sb-ext:make-timer (lambda () (bqueue-push q (list nil e (now-us))))
-                                                             :thread t :name "beacon-delay")
-                                          verdict))
-                 (return-from handle-event-msg (send-ok c raw-id t "")))))
-        (unless (bqueue-push (relay-verify-q relay) (list c e t0))
-          (sb-ext:atomic-incf (stats-busy st))
-          (send-ok c raw-id nil "rate-limited: relay is busy, try again"))))))
+        (admit-event relay c e raw-id t0)))))
+
+(defun admit-event (relay c e raw-id t0)
+  "What happens to a parsed event after its JSON checked out, shared by the
+WebSocket and UDP paths.  C is the connection to answer, or NIL for an event that
+arrived in a datagram: every OK below is then a no-op, so nothing is sent back."
+  (let ((st (relay-stats relay)))
+    ;; cheap early answer for the commonest case: we already have it
+    (let* ((idx (store-index (relay-store relay))) (s (index-find-id idx (event-id e))))
+      (when (and s (not (serial-deleted-p (index-columns idx) s)))
+        (sb-ext:atomic-incf (stats-duplicates st))
+        (return-from admit-event (send-ok c raw-id t "duplicate: already have this event"))))
+    (let* ((policy (config-event-policy (relay-config relay)))
+           (verdict (and policy (handler-case (funcall policy e)
+                                  (error (err) (log-msg 0 "event policy: ~a" err) nil)))))
+      (cond ((null verdict))
+            ((or (eq verdict :drop) (and (consp verdict) (eq (car verdict) :drop)))
+             (sb-ext:atomic-incf (stats-rejected st))
+             (return-from admit-event
+               (send-ok c raw-id nil (format nil "blocked: ~a" (if (consp verdict) (second verdict) "policy")))))
+            ((and (realp verdict) (plusp verdict))
+             (let ((q (relay-verify-q relay)))
+               (sb-ext:schedule-timer (sb-ext:make-timer (lambda () (bqueue-push q (list nil e (now-us))))
+                                                         :thread t :name "beacon-delay")
+                                      verdict))
+             (return-from admit-event (send-ok c raw-id t "")))))
+    (unless (bqueue-push (relay-verify-q relay) (list c e t0))
+      (sb-ext:atomic-incf (stats-busy st))
+      (send-ok c raw-id nil "rate-limited: relay is busy, try again"))))
+
+;;; ---- UDP ingest -----------------------------------------------------------------------
+;;; One signed event per datagram, no handshake and no reply on any path (see
+;;; README, "UDP ingest").  The datagram carries its own proof of authorship, so
+;;; nothing about the sender is kept.  A single thread reads the socket, so the
+;;; rate limit for the whole port is one token bucket with no lock.
+
+(defun udp-secret-integer (hex)
+  "The relay's secret scalar from its 64 hex digits; signals unless it is in [1, n)."
+  (secp:secp-init)
+  (let ((d (bytes->int (hex-decode hex 32))))
+    (unless (< 0 d secp:*secp256k1-n*)
+      (error "udp secret is not a valid secp256k1 scalar"))
+    d))
+
+(defun udp-parse (relay buf n)
+  "The event in the N bytes at the front of BUF, or NIL.  A datagram that opens with
+'{' is plaintext JSON.  Otherwise, when the relay has a secret, it is NIP-44 encrypted
+to the relay (its first byte may itself be '{', so the framing is tried after the
+plaintext parse fails).  A bad signature is not caught here: it parses, and the verify
+pool refuses it."
+  (or (and (= (aref buf 0) 123)
+           (ignore-errors (parse-event-json (subseq buf 0 n))))
+      (let ((secret (relay-udp-key relay)))
+        (and secret (<= 131 n) (= (aref buf 32) 2)
+             (ignore-errors (parse-event-json (nip44-open-datagram secret buf n)))))))
+
+(defun udp-datagram (relay buf n)
+  "Handle the N bytes at the front of BUF, one datagram.  Whatever is wrong with
+it -- too long, rate-limited, not an event, a bad signature -- the sender is told
+nothing, so the port looks the same to a prober as a port with nothing on it.  The
+rate limit comes before any decryption, which costs a curve multiply."
+  (let ((st (relay-stats relay)) (t0 (now-us)))
+    (sb-ext:atomic-incf (stats-received st))
+    (when (> n (config-udp-max-datagram (relay-config relay)))
+      (sb-ext:atomic-incf (stats-invalid st))
+      (return-from udp-datagram nil))
+    (unless (take-token relay (relay-udp-limit relay) :event)
+      (sb-ext:atomic-incf (stats-busy st))
+      (return-from udp-datagram nil))
+    (let ((e (udp-parse relay buf n)))
+      (if e
+          (admit-event relay nil e (event-id-hex e) t0)
+          (sb-ext:atomic-incf (stats-invalid st))))))
+
+(defun udp-loop (relay)
+  (let* ((sock (relay-udp relay)) (fd (socket-fd sock))
+         (buf (make-octets 65536)) (ps (make-pollset)))
+    (loop while (relay-running relay) do
+      (pollset-clear ps)
+      (pollset-add ps fd +pollin+)
+      ;; the timeout is how often a stopping relay notices (RELAY-RUNNING)
+      (when (plusp (pollset-wait ps 500))
+        (let ((n (fd-read fd buf 0 (length buf))))
+          (when (and (integerp n) (plusp n))
+            (sb-ext:atomic-incf (stats-udp (relay-stats relay)))
+            (udp-datagram relay buf n)))))))
 
 (defun valid-sub-id-p (x) (and (stringp x) (<= 1 (length x) 64)))
 
@@ -413,10 +491,10 @@ and let the fanout thread take it out of the index."
 (defun relay-stats-json (relay)
   (let ((st (relay-stats relay)) (store (relay-store relay)))
     (string-utf8
-     (format nil "{\"events\":~d,\"received\":~d,\"stored\":~d,\"duplicates\":~d,\"rejected\":~d,\"invalid\":~d,\"busy\":~d,\"reqs\":~d,\"counts\":~d,\"delivered\":~d,\"connections\":~d,\"verify_queue\":~d,\"query_queue\":~d,\"ingest_p50_us\":~d,\"ingest_p99_us\":~d,\"query_p50_us\":~d,\"query_p99_us\":~d,\"point_cache_hits\":~d,\"point_cache_misses\":~d,\"gc_count\":~d,\"gc_total_ms\":~d,\"gc_max_ms\":~d,\"gc_p99_ms\":~d,\"heap_mb\":~d,\"stage_p99_us\":[~{~d~^,~}],\"stage_max_us\":[~{~d~^,~}],\"io_busy_p99_us\":~d,\"io_busy_max_us\":~d}"
+     (format nil "{\"events\":~d,\"received\":~d,\"stored\":~d,\"duplicates\":~d,\"rejected\":~d,\"invalid\":~d,\"busy\":~d,\"reqs\":~d,\"counts\":~d,\"delivered\":~d,\"udp_datagrams\":~d,\"connections\":~d,\"verify_queue\":~d,\"query_queue\":~d,\"ingest_p50_us\":~d,\"ingest_p99_us\":~d,\"query_p50_us\":~d,\"query_p99_us\":~d,\"point_cache_hits\":~d,\"point_cache_misses\":~d,\"gc_count\":~d,\"gc_total_ms\":~d,\"gc_max_ms\":~d,\"gc_p99_ms\":~d,\"heap_mb\":~d,\"stage_p99_us\":[~{~d~^,~}],\"stage_max_us\":[~{~d~^,~}],\"io_busy_p99_us\":~d,\"io_busy_max_us\":~d}"
              (store-event-count store) (stats-received st) (stats-stored st) (stats-duplicates st)
              (stats-rejected st) (stats-invalid st) (stats-busy st) (stats-reqs st) (stats-counts st)
-             (stats-delivered st) (server-connections (relay-server relay))
+             (stats-delivered st) (stats-udp st) (server-connections (relay-server relay))
              (bqueue-count (relay-verify-q relay)) (bqueue-count (relay-query-q relay))
              (hist-percentile (stats-ingest-hist st) 0.5) (hist-percentile (stats-ingest-hist st) 0.99)
              (hist-percentile (stats-query-hist st) 0.5) (hist-percentile (stats-query-hist st) 0.99)
@@ -628,6 +706,17 @@ crash of the MACHINE can lose up to one interval."
             do (let ((fo fo))
                  (push (sb-thread:make-thread (lambda () (fanout-loop relay fo)) :name (format nil "beacon-fanout-~d" i))
                        (relay-threads relay)))))
+    (when (config-udp-port config)
+      (let ((key (and (config-udp-secret config) (udp-secret-integer (config-udp-secret config)))))
+        (setf (relay-udp-key relay) key
+              (relay-udp relay) (make-udp-socket (config-host config) (config-udp-port config))
+              (relay-udp-limit relay) (make-cstate :event-tokens (float (config-event-burst config) 1d0)
+                                                   :refilled (now-us))))
+      (push (sb-thread:make-thread (lambda () (udp-loop relay)) :name "beacon-udp") (relay-threads relay))
+      (log-msg 1 "beacon udp on ~a:~d~@[ (NIP-44 encrypted, relay pubkey ~a)~]"
+               (config-host config) (listener-port (relay-udp relay))
+               (and (relay-udp-key relay)
+                    (hex-encode (schnorr:pubkey-xonly (relay-udp-key relay))))))
     (setf (relay-server relay)
           (start-server :host (config-host config) :port (config-port config)
                         :io-threads (config-io-threads config)
@@ -649,6 +738,7 @@ crash of the MACHINE can lose up to one interval."
   (dolist (q (list (relay-verify-q relay) (relay-query-q relay))) (bqueue-close q))
   ;; let the writer and fanout drain what was already accepted
   (dolist (th (relay-threads relay)) (ignore-errors (sb-thread:join-thread th :timeout 10)))
+  (when (relay-udp relay) (close-socket (relay-udp relay)))   ; its thread has been joined
   (bqueue-close (relay-writer-q relay))
   (loop for fo across (relay-fanouts relay) do (bqueue-close (fanout-q fo)))
   (close-store (relay-store relay))

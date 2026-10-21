@@ -36,6 +36,8 @@
             ((string= a "--description") (setf (getf plist :description) (val)))
             ((string= a "--pubkey") (setf (getf plist :pubkey) (val)))
             ((string= a "--contact") (setf (getf plist :contact) (val)))
+            ((string= a "--udp-port") (setf (getf plist :udp-port) (int)))
+            ((string= a "--udp-secret") (setf (getf plist :udp-secret) (val)))
             ((string= a "--events-per-second") (setf (getf plist :events-per-second) (int)))
             ((string= a "--event-burst") (setf (getf plist :event-burst) (int)))
             ((string= a "--reqs-per-second") (setf (getf plist :reqs-per-second) (int)))
@@ -55,6 +57,9 @@
        ;; a relay holds millions of objects in unboxed arrays and makes short-lived
        ;; garbage per message; a larger nursery means fewer stop-the-world pauses
        (setf (sb-ext:bytes-consed-between-gcs) (* 256 1024 1024))
+       ;; the secret is better kept out of the process list: the environment is the fallback
+       (unless (getf plist :udp-secret)
+         (setf (getf plist :udp-secret) (sb-ext:posix-getenv "BEACON_UDP_SECRET")))
        (let ((relay (start-relay (apply #'make-config plist))))
          (handler-case
              (loop (sleep 60)

@@ -198,3 +198,119 @@
                       (check "ephemeral the predicate refuses is not retained" (null (by-kind 20001 :since since)))))
                (cl-nostr.relay:close-relay r))))
       (stop-relay relay))))
+
+;;; ---- UDP ingest ------------------------------------------------------------------------
+;;; One signed event per datagram, from a plain socket that is not a client of the
+;;; relay.  The checks look at both ends: what the relay stored and fanned out to a
+;;; WebSocket subscriber, and what came back to the sender (nothing, on any path).
+
+(defparameter *udp-relay-secret* (make-string 64 :initial-element #\1)
+  "The relay's secret key for the encrypted-datagram tests (a valid scalar).")
+
+(defun udp-send-octets (sock port octets)
+  (sb-bsd-sockets:socket-send sock octets (length octets) :address (list #(127 0 0 1) port)))
+
+(defun udp-send (sock port text)
+  (udp-send-octets sock port (sb-ext:string-to-octets text :external-format :utf-8)))
+
+(defun udp-got-reply-p (sock &optional (ms 300))
+  "True if a datagram arrived at SOCK within MS milliseconds."
+  (let ((ps (beacon::make-pollset)))
+    (beacon::pollset-add ps (beacon::socket-fd sock) beacon::+pollin+)
+    (plusp (beacon::pollset-wait ps ms))))
+
+(defun run-udp-tests ()
+  "UDP ingest: a datagram is stored (or refused) with no reply on any path."
+  (let* ((dir (fresh-dir "udp"))
+         (relay (start-relay (make-config :port 0 :udp-port 0 :udp-secret *udp-relay-secret*
+                                          :dir (namestring dir) :io-threads 1
+                                          :verify-threads 2 :query-threads 1 :sync nil
+                                          :events-per-second 100000 :event-burst 100000)))
+         (*relay* relay)
+         (sender (make-instance 'sb-bsd-sockets:inet-socket :type :datagram :protocol :udp))
+         (sub nil))
+    (unwind-protect
+         (let* ((port (beacon::listener-port (beacon::relay-udp relay)))
+                (stats (beacon::relay-stats relay))
+                (key (make-test-key))
+                (author (beacon::hex-encode (cdr key)))
+                (live '()))
+           (flet ((send (text) (udp-send sender port text))
+                  (stored () (store-event-count (beacon::relay-store relay)))
+                  (counter (fn) (funcall fn stats)))
+             (let ((good (sign-event-json key 1 "udp hello")))
+               (send good)
+               (check "udp: valid event stored" (wait-until (lambda () (= 1 (stored)))))
+               (send good)
+               (check "udp: resent event counted as a duplicate"
+                      (wait-until (lambda () (>= (counter #'beacon::stats-duplicates) 1))))
+               (check "udp: no reply to an accepted event" (not (udp-got-reply-p sender))))
+             (send (sign-event-json key 1 "forged" :fake-sig t))
+             (check "udp: bad signature counted invalid"
+                    (wait-until (lambda () (>= (counter #'beacon::stats-invalid) 1))))
+             (send "not json at all")
+             (send (sign-event-json key 1 (make-string 1600 :initial-element #\x)))
+             (check "udp: garbage and oversize counted invalid"
+                    (wait-until (lambda () (>= (counter #'beacon::stats-invalid) 3))))
+             (send (sign-event-json key 1 "barrier"))
+             (check "udp: later valid event stored" (wait-until (lambda () (= 2 (stored)))))
+             (check "udp: refused datagrams are not stored" (= 2 (stored)))
+             ;; live: a WebSocket subscriber sees a datagram event like any other
+             (setf sub (cl-nostr.relay:connect-relay (relay-url)))
+             (let ((eose nil))
+               (cl-nostr.relay:subscribe sub (cl-nostr.filter:make-filter :kinds '(1) :authors (list author))
+                                         :on-event (lambda (e rl) (declare (ignore rl)) (push e live))
+                                         :on-eose (lambda (rl) (declare (ignore rl)) (setf eose t)))
+               (wait-until (lambda () eose)))
+             (send (sign-event-json key 1 "udp live"))
+             (check "udp: live subscriber receives the datagram event"
+                    (wait-until (lambda ()
+                                  (find "udp live" live :key #'cl-nostr.event:event-content :test #'string=))))
+             ;; cl-nostr's own UDP sender: its event stored, then read back over a
+             ;; WebSocket and verified by cl-nostr -- the two implementations agree
+             (let* ((kp (nkey))
+                    (e (note kp (format nil "cl-nostr over UDP: naïve ☃ ~a" (code-char #x1F600))
+                             :tags '(("t" "udp"))))
+                    (id (cl-nostr.udp:publish-datagram "127.0.0.1" port e)))
+               (check "udp: cl-nostr's datagram stored" (wait-until (lambda () (= 4 (stored)))))
+               (let ((r3 (cl-nostr.relay:connect-relay (relay-url))))
+                 (unwind-protect
+                      (let ((got (fetch r3 (cl-nostr.filter:make-filter :ids (list id)))))
+                        (check "udp: cl-nostr reads its datagram back, content and signature intact"
+                               (and got
+                                    (string= id (cl-nostr.event:event-id (first got)))
+                                    (string= (cl-nostr.event:event-content e)
+                                             (cl-nostr.event:event-content (first got)))
+                                    (cl-nostr.event:verify-event (first got)))))
+                   (cl-nostr.relay:close-relay r3))))
+             ;; NIP-44 encrypted datagrams, addressed to the relay's key (cl-nostr seals them)
+             (let* ((relay-pub (cl-nostr.keys:public-hex (cl-nostr.keys:keypair-from-secret *udp-relay-secret*)))
+                    (author (nkey))
+                    (sealed (note author "sealed for the relay"))
+                    (tampered (cl-nostr.udp:encrypted-datagram (note author "tampered") relay-pub))
+                    (ephemeral (loop for kp = (nkey)
+                                     when (string= "7b" (subseq (cl-nostr.keys:public-hex kp) 0 2))
+                                       return kp))
+                    (colliding (cl-nostr.udp:encrypt-datagram ephemeral (note author "ephemeral begins with a brace")
+                                                              relay-pub)))
+               (check "udp: the colliding datagram really begins with '{'" (= #x7b (aref colliding 0)))
+               (cl-nostr.udp:publish-datagram-encrypted "127.0.0.1" port sealed relay-pub)
+               (check "udp: encrypted datagram opened and stored" (wait-until (lambda () (= 5 (stored)))))
+               (cl-nostr.udp:publish-datagram-encrypted "127.0.0.1" port (note author "for someone else")
+                                                        (cl-nostr.keys:public-hex (nkey)))
+               (check "udp: encrypted to another key refused"
+                      (wait-until (lambda () (>= (counter #'beacon::stats-invalid) 4))))
+               (let ((altered (copy-seq tampered)))
+                 (setf (aref altered (1- (length altered))) (logxor 1 (aref altered (1- (length altered)))))
+                 (udp-send-octets sender port altered))
+               (check "udp: altered encrypted datagram refused"
+                      (wait-until (lambda () (>= (counter #'beacon::stats-invalid) 5))))
+               (udp-send-octets sender port colliding)
+               (check "udp: a datagram whose ephemeral key begins with '{' is opened"
+                      (wait-until (lambda () (= 6 (stored)))))
+               (check "udp: refused encrypted datagrams stored nothing" (= 6 (stored))))
+             (check "udp: every datagram was read" (= 12 (counter #'beacon::stats-udp)))
+             (check "udp: nothing ever came back to the sender" (not (udp-got-reply-p sender 300)))))
+      (when sub (ignore-errors (cl-nostr.relay:close-relay sub)))
+      (ignore-errors (sb-bsd-sockets:socket-close sender))
+      (stop-relay relay))))

@@ -27,8 +27,54 @@ Options (`src/main.lisp`): `--host`, `--port`, `--dir`, `--io-threads`,
 `--verify-threads`, `--query-threads`, `--fanout-threads`,
 `--fsync always|interval|never`, `--fsync-interval-ms`, `--events-per-second`,
 `--event-burst`, `--reqs-per-second`, `--req-burst`, `--max-connections`,
-`--name`, `--description`, `--pubkey`, `--contact`, `--log-level`.
+`--name`, `--description`, `--pubkey`, `--contact`, `--log-level`, `--udp-port`,
+`--udp-secret`.
 `GET /stats` returns counters, latency percentiles and GC pauses as JSON.
+
+## UDP ingest (single-datagram events)
+
+`--udp-port N` (or `make-config :udp-port`) also listens for events on UDP,
+on the same host as the WebSocket listener. One datagram carries one signed
+event in the NIP-01 JSON form, and that is the whole exchange: no handshake, no
+connection, no reply. Whatever is wrong with a datagram (not JSON, a bad
+signature, longer than `udp-max-datagram`, which defaults to the 1472 bytes that
+fit one unfragmented Ethernet frame) it is dropped in silence, so a sender learns
+nothing from the relay, not even that it was refused. Accepted events take the
+same path as WebSocket EVENTs (duplicate check, policy, verification, group
+commit, live fanout), and share `events-per-second` / `event-burst` through a
+token bucket of their own.
+
+```sh
+./run.sh --port 7777 --udp-port 7778
+nak event -k 1 -c "hello" --sec $(nak key generate) | nc -u -w1 127.0.0.1 7778
+```
+
+The design is from laantungir's "UDP nostr" (github.com/laantungir/udp_nostr,
+`README.md`): the event's own signature takes the place of a handshake, so a
+probe sees a silent UDP port.
+
+**Encrypted datagrams (NIP-44 v2).** With `--udp-secret HEX` (64 hex digits; or
+the `BEACON_UDP_SECRET` environment variable, which keeps it out of the process
+list), the relay also accepts events sealed to its public key, which it logs at
+startup. An encrypted datagram is the sender's ephemeral x-only pubkey (32 bytes)
+followed by a NIP-44 v2 payload. Plaintext and encrypted datagrams share the
+port: a datagram opening with `{` is tried as JSON first, then as encrypted
+framing, so an encrypted datagram whose ephemeral key begins with `{` still
+opens. Decryption costs one constant-time curve multiply, and it sits behind the
+rate limit, so a flood of encrypted garbage is bounded the same as a flood of
+plaintext. The primitives (ChaCha20 per RFC 8439, HMAC and HKDF on the relay's
+SHA-256) are in `src/nip44.lisp`, validated against the official NIP-44 vectors
+in `test/nip44.vectors.json` (paulmillr/nip44).
+
+```sh
+./run.sh --port 7777 --udp-port 7778 --udp-secret "$(cat relay.hex)"
+```
+
+`test/network.lisp` (`run-udp-tests`) covers it end to end: valid, duplicate,
+forged, garbage and oversize datagrams, a live WebSocket subscriber, and silence
+back to the sender; then, through cl-nostr's sealed sender, an encrypted datagram
+opened and stored, one sealed to another key and one altered, both refused, and
+one whose ephemeral key begins with `{`.
 
 Two hooks, available from Lisp (`make-config`), not the command line:
 `:event-policy` (a function of each parsed EVENT: accept, refuse with a

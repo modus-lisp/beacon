@@ -22,6 +22,7 @@
      (:file "json")       ; JSON reader (json-simple) + NIP-01 writer
      (:file "event")      ; parse / validate / canonical id / stored form
      (:file "verify")     ; BIP340 verify with a decoded-pubkey cache
+     (:file "nip44")      ; NIP-44 v2 decryption for encrypted UDP datagrams
      (:file "filter")     ; NIP-01 filters: parse, match
      (:file "log")        ; the append-only event log on disk
      (:file "index")      ; in-memory unboxed indexes (single writer, lock-free readers)

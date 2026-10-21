@@ -360,6 +360,110 @@ boundary, and records (10 KB, 200 KB) larger than a chunk."
   (test-store-semantics)
   (test-store-model))
 
+;;; ---- NIP-44 v2 decryption ---------------------------------------------------------------
+;;; The official vectors (test/nip44.vectors.json, from paulmillr/nip44) for the decryption
+;;; side, and the RFC primitives beneath it against values computed with Python's
+;;; cryptography library -- not with this code, and not from memory.
+
+(defun base64-decode-octets (string)
+  "RFC 4648 base64 to octets.  Test-side only: the relay itself never sees base64."
+  (let ((alphabet "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/")
+        (bits 0) (nbits 0)
+        (out (make-array 0 :element-type '(unsigned-byte 8) :adjustable t :fill-pointer 0)))
+    (loop for ch across string
+          for v = (position ch alphabet)
+          when v do (setf bits (logior (ash bits 6) v)) (incf nbits 6)
+          when (>= nbits 8)
+            do (decf nbits 8)
+               (vector-push-extend (ldb (byte 8 nbits) bits) out)
+               (setf bits (ldb (byte nbits 0) bits)))
+    (coerce out '(simple-array (unsigned-byte 8) (*)))))
+
+(defun nip44-vectors-section (name &optional (kind "valid"))
+  "The NAME section of the KIND (\"valid\" or \"invalid\") v2 official vectors."
+  (json-get (json-get (json-get (json-parse-string
+                                 (uiop:read-file-string (asdf:system-relative-pathname "beacon" "test/nip44.vectors.json")))
+                                "v2")
+                      kind)
+            name))
+
+(defun run-nip44-tests ()
+  (progn
+    ;; RFC 8439 2.4.2: ChaCha20 with block counter 1
+    (let ((key (coerce (loop for i below 32 collect i) '(simple-array (unsigned-byte 8) (*))))
+          (nonce (hex-decode "000000000000004a00000000"))
+          (pt (ascii-octets "Ladies and Gentlemen of the class of '99: If I could offer you only one tip for the future, sunscreen would be it.")))
+      (check "chacha20 RFC 8439 2.4.2 keystream"
+             (equalp (beacon::chacha20-xor key nonce pt :counter 1)
+                     (hex-decode "6e2e359a2568f98041ba0728dd0d6981e97e7aec1d4360c20a27afccfd9fae0bf91b65c5524733ab8f593dabcd62b3571639d624e65152ab8f530c359f0861d807ca0dbf500d6a6156a38e088a22b65e52bc514d16ccf806818ce91ab77937365af90bbf74a35be6b40b8eedf2785e42874d"))))
+    ;; RFC 4231 test case 1, RFC 5869 test case 1
+    (check "hmac-sha256 RFC 4231 test 1"
+           (equalp (beacon::hmac-sha256 (make-array 20 :element-type '(unsigned-byte 8) :initial-element #x0b)
+                                (ascii-octets "Hi There"))
+                   (hex-decode "b0344c61d8db38535ca8afceaf0bf12b881dc200c9833da726e9376c2e32cff7")))
+    (let* ((ikm (make-array 22 :element-type '(unsigned-byte 8) :initial-element #x0b))
+           (salt (coerce (loop for i below 13 collect i) '(simple-array (unsigned-byte 8) (*))))
+           (info (coerce (loop for i from #xf0 below #xfa collect i) '(simple-array (unsigned-byte 8) (*))))
+           (prk (beacon::hkdf-extract salt ikm)))
+      (check "hkdf-extract RFC 5869 test 1"
+             (equalp prk (hex-decode "077709362c2e32df0ddc3f0dc47bba6390b6c73bb50f9c3122ec844ad7c2b3e5")))
+      (check "hkdf-expand RFC 5869 test 1"
+             (equalp (beacon::hkdf-expand prk info 42)
+                     (hex-decode "3cb25f25faacd57a90434f64d0362f2a2d2d0a90cf1a5a4c5db02d56ecc4c5bf34007208d5b887185865"))))
+    ;; the official vectors
+    (let ((bad 0))
+      (loop for pair across (nip44-vectors-section "calc_padded_len")
+            unless (= (aref pair 1) (beacon::nip44-calc-padded-len (aref pair 0)))
+              do (incf bad))
+      (check "calc_padded_len matches the official vectors" (zerop bad)))
+    (let ((bad 0) (n 0))
+      (loop for e across (nip44-vectors-section "get_conversation_key")
+            do (incf n)
+               (unless (equalp (beacon::nip44-conversation-key (beacon::bytes->int (hex-decode (json-get e "sec1")))
+                                                       (hex-decode (json-get e "pub2")))
+                               (hex-decode (json-get e "conversation_key")))
+                 (incf bad)))
+      (check (format nil "conversation keys match the official vectors (~d)" n) (and (plusp n) (zerop bad))))
+    (let ((bad 0) (n 0))
+      (let* ((section (nip44-vectors-section "get_message_keys"))
+             (ck (hex-decode (json-get section "conversation_key"))))
+            (progn
+                 (loop for k across (json-get section "keys")
+                       do (incf n)
+                          (let* ((okm (beacon::hkdf-expand ck (hex-decode (json-get k "nonce")) 76)))
+                            (unless (and (equalp (subseq okm 0 32) (hex-decode (json-get k "chacha_key")))
+                                         (equalp (subseq okm 32 44) (hex-decode (json-get k "chacha_nonce")))
+                                         (equalp (subseq okm 44 76) (hex-decode (json-get k "hmac_key"))))
+                              (incf bad))))))
+      (check (format nil "message keys match the official vectors (~d)" n) (and (plusp n) (zerop bad))))
+    (let ((bad 0) (n 0))
+      (loop for e across (nip44-vectors-section "encrypt_decrypt")
+            do (incf n)
+               (let* ((ck (hex-decode (json-get e "conversation_key")))
+                      (plain (sb-ext:string-to-octets (json-get e "plaintext") :external-format :utf-8))
+                      (payload (base64-decode-octets (json-get e "payload"))))
+                 (unless (equalp (beacon::nip44-decrypt ck payload) plain) (incf bad))))
+      (check (format nil "decrypt the official encrypt/decrypt vectors (~d)" n) (and (plusp n) (zerop bad))))
+    ;; the key that opens them is derived from the two private keys, too
+    (let ((bad 0))
+      (loop for e across (nip44-vectors-section "encrypt_decrypt")
+            unless (equalp (beacon::nip44-conversation-key (beacon::bytes->int (hex-decode (json-get e "sec1")))
+                                                   (secp256k1-fast.schnorr:pubkey-xonly
+                                                    (beacon::bytes->int (hex-decode (json-get e "sec2")))))
+                           (hex-decode (json-get e "conversation_key")))
+              do (incf bad))
+      (check "conversation keys from the two private keys (encrypt_decrypt)" (zerop bad)))
+    ;; every invalid payload must be refused
+    (let ((refused 0) (n 0))
+      (loop for e across (nip44-vectors-section "decrypt" "invalid")
+            do (incf n)
+               (when (handler-case (progn (beacon::nip44-decrypt (hex-decode (json-get e "conversation_key"))
+                                                         (base64-decode-octets (json-get e "payload")))
+                                          nil)
+                       (error () t))
+                 (incf refused)))
+      (check (format nil "all ~d invalid payloads refused" n) (and (plusp n) (= refused n))))))
+
 ;;; ---- entry ------------------------------------------------------------------------------
 
 (defun run-section (name fn)
@@ -391,9 +495,11 @@ boundary, and records (10 KB, 200 KB) larger than a chunk."
   (run-section "index structures" #'test-index-structures)
   (run-section "store model" #'test-store-model)
   (run-section "huge limit" #'test-huge-limit)
+  (run-section "nip44 v2" #'run-nip44-tests)
   (run-section "store model, 100k events (crosses chunk + resize boundaries)"
                (lambda () (test-store-model :n 100000 :queries 120)))
   (when (and network (fboundp 'run-network-tests)) (run-section "network" 'run-network-tests))
   (when (and network (fboundp 'run-policy-tests)) (run-section "policy" 'run-policy-tests))
+  (when (and network (fboundp 'run-udp-tests)) (run-section "udp" 'run-udp-tests))
   (format t "~&~d passed, ~d failed~%" *pass* *fail*)
   (zerop *fail*))
