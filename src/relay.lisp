@@ -348,13 +348,16 @@ arrived in a datagram: every OK below is then a no-op, so nothing is sent back."
 ;;; nothing about the sender is kept.  A single thread reads the socket, so the
 ;;; rate limit for the whole port is one token bucket with no lock.
 
-(defun udp-secret-integer (hex)
-  "The relay's secret scalar from its 64 hex digits; signals unless it is in [1, n)."
+(defun udp-secret-key (hex)
+  "The relay's secret key from its 64 hex digits, as a fixed 32-byte buffer (natrium's
+gossamer); the decoded heap bytes are wiped.  Signals unless it is in [1, n)."
   (secp:secp-init)
-  (let ((d (bytes->int (hex-decode hex 32))))
-    (unless (< 0 d secp:*secp256k1-n*)
+  (let* ((heap (hex-decode hex 32))
+         (key (prog1 (gossamer:pooled-copy heap) (fill heap 0))))
+    (unless (secp:seckey-valid-p key)
+      (gossamer:free key)
       (error "udp secret is not a valid secp256k1 scalar"))
-    d))
+    key))
 
 (defun udp-parse (relay buf n)
   "The event in the N bytes at the front of BUF, or NIL.  A datagram that opens with
@@ -707,7 +710,7 @@ crash of the MACHINE can lose up to one interval."
                  (push (sb-thread:make-thread (lambda () (fanout-loop relay fo)) :name (format nil "beacon-fanout-~d" i))
                        (relay-threads relay)))))
     (when (config-udp-port config)
-      (let ((key (and (config-udp-secret config) (udp-secret-integer (config-udp-secret config)))))
+      (let ((key (and (config-udp-secret config) (udp-secret-key (config-udp-secret config)))))
         (setf (relay-udp-key relay) key
               (relay-udp relay) (make-udp-socket (config-host config) (config-udp-port config))
               (relay-udp-limit relay) (make-cstate :event-tokens (float (config-event-burst config) 1d0)

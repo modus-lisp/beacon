@@ -9,9 +9,13 @@
 ;;;;
 ;;;; Everything here is beacon's own: SHA-256 from hash.lisp, ChaCha20 (RFC 8439)
 ;;;; below, HMAC and HKDF on top of SHA-256.  The one curve operation is
-;;;; CT-MUL-POINT, because the multiplier is the relay's secret key and the
-;;;; variable-time multiply leaks it through timing.  The official vectors
-;;;; (nip44.vectors.json) are in test/test.lisp.
+;;;; secp256k1-fast's constant-time ECDH-X with the relay's secret key, which is a
+;;;; fixed 32-byte buffer (natrium's gossamer: memory the collector never moves)
+;;;; and never an integer.  What comes after the ECDH -- the conversation and
+;;;; message keys -- is per datagram, from the sender's one-time ephemeral key,
+;;;; and protects only a datagram whose event the relay then publishes, so it
+;;;; stays in beacon's own primitives.  The official vectors (nip44.vectors.json)
+;;;; are in test/test.lisp.
 
 (in-package #:beacon)
 
@@ -102,15 +106,16 @@ block COUNTER (RFC 8439).  Returns a fresh octet vector."
 ;;; ---- NIP-44 v2 -----------------------------------------------------------------
 
 (defun nip44-conversation-key (secret peer-xonly)
-  "The 32-byte conversation key between SECRET (an integer) and PEER-XONLY (32 octets).
-The peer point is lifted from its x coordinate and must lie on the curve, which
-LIFT-X guarantees; the product is taken in constant time."
+  "The 32-byte conversation key between SECRET (a fixed 32-byte private key) and
+PEER-XONLY (32 octets).  The peer point is lifted from its x coordinate and must lie
+on the curve, which LIFT-X guarantees; the ECDH is constant-time, and refuses the
+point at infinity."
   (secp:secp-init)
-  (let* ((point (or (schnorr:lift-x (bytes->int peer-xonly))
-                    (error "nip44: peer is not a curve point")))
-         (product (secp:ct-mul-point secret point)))
-    (when (secp:secp-inf-p product) (error "nip44: shared point is at infinity"))
-    (hkdf-extract (ascii-octets "nip44-v2") (secp:int-to-bytes32 (car product)))))
+  (let ((point (or (schnorr:lift-x (bytes->int peer-xonly))
+                   (error "nip44: peer is not a curve point")))
+        (x (make-octets 32)))
+    (secp256k1-fast.ecdh:ecdh-x secret point x)
+    (hkdf-extract (ascii-octets "nip44-v2") x)))
 
 (defun nip44-calc-padded-len (len)
   "The padded length NIP-44 gives a plaintext of LEN bytes (LEN >= 1)."

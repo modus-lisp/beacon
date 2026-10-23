@@ -38,8 +38,10 @@
 ;;; ---- signing test events -------------------------------------------------------
 
 (defun make-test-key (&optional (seed (random (ash 1 250))))
-  "(secret-int . pubkey-octets)"
-  (let ((d (1+ (mod seed (1- secp256k1-fast:*secp256k1-n*)))))
+  "(secret . pubkey-octets): the secret a fixed 32-byte buffer, as the signer takes it.
+Test keys come from CL:RANDOM and are not secret."
+  (let ((d (gossamer:pooled-copy
+            (secp256k1-fast:int-to-bytes32 (1+ (mod seed (1- secp256k1-fast:*secp256k1-n*)))))))
     (cons d (secp256k1-fast.schnorr:pubkey-xonly d))))
 
 (defun json-escape (s)
@@ -419,7 +421,7 @@ boundary, and records (10 KB, 200 KB) larger than a chunk."
     (let ((bad 0) (n 0))
       (loop for e across (nip44-vectors-section "get_conversation_key")
             do (incf n)
-               (unless (equalp (beacon::nip44-conversation-key (beacon::bytes->int (hex-decode (json-get e "sec1")))
+               (unless (equalp (beacon::nip44-conversation-key (gossamer:pooled-copy (hex-decode (json-get e "sec1")))
                                                        (hex-decode (json-get e "pub2")))
                                (hex-decode (json-get e "conversation_key")))
                  (incf bad)))
@@ -447,9 +449,9 @@ boundary, and records (10 KB, 200 KB) larger than a chunk."
     ;; the key that opens them is derived from the two private keys, too
     (let ((bad 0))
       (loop for e across (nip44-vectors-section "encrypt_decrypt")
-            unless (equalp (beacon::nip44-conversation-key (beacon::bytes->int (hex-decode (json-get e "sec1")))
+            unless (equalp (beacon::nip44-conversation-key (gossamer:pooled-copy (hex-decode (json-get e "sec1")))
                                                    (secp256k1-fast.schnorr:pubkey-xonly
-                                                    (beacon::bytes->int (hex-decode (json-get e "sec2")))))
+                                                    (gossamer:pooled-copy (hex-decode (json-get e "sec2")))))
                            (hex-decode (json-get e "conversation_key")))
               do (incf bad))
       (check "conversation keys from the two private keys (encrypt_decrypt)" (zerop bad)))
